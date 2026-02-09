@@ -1,0 +1,15 @@
+services:
+  mailfetcher:
+    build: .
+    container_name: mailfetcher
+    restart: unless-stopped
+    volumes:
+      - ./config.ini:/config/config.ini:ro
+      - mailfetcher_state:/data
+    env_file:
+      - ./secrets.env
+    environment:
+      - TZ=America/Montreal
+
+volumes:
+  mailfetcher_state:

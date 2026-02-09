@@ -1,0 +1,22 @@
+[Unit]
+Description=MXroute to Gmail IMAP fetcher (move)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mailfetcher.py /etc/mailfetcher/config.ini
+Restart=always
+RestartSec=5
+User=mailfetcher
+Group=mailfetcher
+
+# Hardening (optional but nice)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mailfetcher
+
+[Install]
+WantedBy=multi-user.target
