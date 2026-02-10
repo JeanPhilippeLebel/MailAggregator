@@ -71,7 +71,8 @@ Source mailbox (`[src_*]`)
 - `source_password`: Optional plain-text fallback (not recommended).
 - `source_folder`: Folder to pull from (default `INBOX`).
 - `dest_profile`: Gmail profile name to receive mail.
-- `dest_folder`: Gmail label/folder to append into.
+- `dest_folder`: Comma-separated list of Gmail labels to apply. If empty, defaults to the source email address.
+  Include `\Inbox` to force a message to appear in Inbox. System labels (like `\Inbox`) are not auto-created.
 
 Local/Service Install (systemd)
 -------------------------------
