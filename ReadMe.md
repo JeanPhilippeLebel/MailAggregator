@@ -6,8 +6,8 @@ Overview
 This repo contains a small IMAP-to-Gmail mail mover. It pulls new messages
 from one or more source IMAP mailboxes and appends them into Gmail folders
 (labels). After a successful append, the source message is deleted and
-expunged. It keeps a local SQLite DB with UIDVALIDITY and the last copied UID
-so it only moves new mail on the next poll.
+expunged. Each poll scans the current source folder and moves whatever is
+still present.
 
 Gmail Setup (per destination account)
 ------------------------------------
@@ -32,12 +32,12 @@ What It Does
 What It Does Not Do
 -------------------
 - Sync sent mail (send from Gmail instead)
-- Backfill old history unless UIDs are reset
+- Keep source-side history after it has been moved
 
 Configuration Files
 -------------------
 `config.ini`
-- General section controls polling interval, log level, state DB path.
+- General section controls polling interval and log level.
 - `gmail_*` sections define each Gmail destination profile.
 - `src_*` sections define each source mailbox and its destination mapping.
 
@@ -52,7 +52,6 @@ Configuration Reference
 -----------------------
 General (`[general]`)
 - `poll_seconds`: Poll interval in seconds.
-- `state_db`: Path to SQLite DB used to track UIDVALIDITY and last UID.
 - `log_level`: `DEBUG`, `INFO`, `WARNING`, or `ERROR`.
 - `create_labels`: `yes`/`no` to auto-create destination Gmail labels.
 
@@ -85,11 +84,31 @@ sudo chown -R mailfetcher:mailfetcher /var/lib/mailfetcher
 sudo chmod 700 /var/lib/mailfetcher
 ```
 
+Install app:
+```
+sudo cp mailfetcher.py /usr/local/bin/mailfetcher.py
+sudo chmod 755 /usr/local/bin/mailfetcher.py
+sudo chown root:root /usr/local/bin/mailfetcher.py
+```
+
 Install config:
 ```
 sudo cp config.ini /etc/mailfetcher/config.ini
-sudo chmod 600 /etc/mailfetcher/config.ini
-sudo chown root:root /etc/mailfetcher/config.ini
+sudo chown root:mailfetcher /etc/mailfetcher/config.ini
+sudo chmod 640 /etc/mailfetcher/config.ini
+```
+
+Install secrets:
+```
+sudo cp secrets.env /etc/mailfetcher/secrets.env
+sudo chown root:mailfetcher /etc/mailfetcher/secrets.env
+sudo chmod 640 /etc/mailfetcher/secrets.env
+```
+
+Install service unit:
+```
+sudo cp mailfetcher.service /etc/systemd/system/mailfetcher.service
+sudo systemctl daemon-reload
 ```
 
 Enable and start:
@@ -125,9 +144,8 @@ Troubleshooting
 ---------------
 - Authentication failures: Confirm IMAP is enabled in Gmail and the app password
   is referenced correctly in `config.ini` and exported in `secrets.env`.
-- No new messages: Check that `source_folder` is correct and that the last UID
-  in the state DB is not ahead of the mailbox. If you need a reset, delete the
-  state DB and restart.
+- No messages moved: Check that `source_folder` is correct and that another
+  client is not moving or deleting messages before MailAggregator sees them.
 - Messages not appearing in Gmail: Verify the `dest_profile` and `dest_folder`
   values and that the destination Gmail account is connected.
 - Frequent retries: Network instability or provider rate limits can cause

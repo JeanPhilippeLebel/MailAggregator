@@ -5,14 +5,12 @@ Mail fetcher:
 - Appends new messages into Gmail via IMAP APPEND.
 - Applies Gmail labels from config; defaults to per-source label (source email address).
 - Deletes from source only after a successful append+label.
-- Tracks UIDVALIDITY/last UID per mailbox in a local sqlite DB.
 """
 import configparser
 import imaplib
 import logging
 import os
 import signal
-import sqlite3
 import ssl
 import sys
 import time
@@ -31,62 +29,6 @@ def handle_signal(signum, frame):
 
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
-
-
-def now_ts():
-    # Unix epoch seconds for DB timestamps.
-    return int(time.time())
-
-
-def ensure_dir(path):
-    # Create parent directory for a file path if it does not exist.
-    d = os.path.dirname(path)
-    if d and not os.path.isdir(d):
-        os.makedirs(d, exist_ok=True)
-
-
-class StateDB:
-    def __init__(self, path):
-        # Persist mailbox sync state locally so we only copy new mail.
-        ensure_dir(path)
-        self.conn = sqlite3.connect(path)
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mailbox_state (
-                mailbox_id TEXT PRIMARY KEY,
-                uidvalidity INTEGER NOT NULL,
-                last_uid INTEGER NOT NULL,
-                updated_ts INTEGER NOT NULL
-            )
-            """
-        )
-        self.conn.commit()
-
-    def get(self, mailbox_id):
-        # Read UIDVALIDITY + last UID for a mailbox id.
-        cur = self.conn.execute(
-            "SELECT uidvalidity, last_uid FROM mailbox_state WHERE mailbox_id = ?",
-            (mailbox_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {"uidvalidity": int(row[0]), "last_uid": int(row[1])}
-
-    def put(self, mailbox_id, uidvalidity, last_uid):
-        # Upsert current UIDVALIDITY + last UID.
-        self.conn.execute(
-            """
-            INSERT INTO mailbox_state (mailbox_id, uidvalidity, last_uid, updated_ts)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(mailbox_id) DO UPDATE SET
-                uidvalidity=excluded.uidvalidity,
-                last_uid=excluded.last_uid,
-                updated_ts=excluded.updated_ts
-            """,
-            (mailbox_id, int(uidvalidity), int(last_uid), now_ts()),
-        )
-        self.conn.commit()
 
 
 def require_env(var_name, section_name):
@@ -135,7 +77,7 @@ def imap_login(host, port, username, password, timeout=30):
 
 
 def imap_select(c, folder):
-    # Select folder (read/write) for UID and FETCH operations.
+    # Select folder (read/write) for message fetch and delete operations.
     logging.info("Selecting folder %s", folder)
     typ, data = c.select('"%s"' % folder, readonly=False)
     if typ != "OK":
@@ -143,28 +85,16 @@ def imap_select(c, folder):
     return data
 
 
-def imap_get_uidvalidity(c, folder):
-    # UIDVALIDITY changes mean UIDs can no longer be trusted (RFC 3501).
-    typ, data = c.response("UIDVALIDITY")
-    if typ == "OK" and data and data[0]:
+def _parse_search_data(data):
+    if not data or not data[0]:
+        return []
+    out = []
+    for p in data[0].split():
         try:
-            return int(data[0])
+            out.append(int(p))
         except Exception:
             pass
-
-    typ, data = c.status('"%s"' % folder, "(UIDVALIDITY)")
-    if typ == "OK" and data:
-        for item in data:
-            if not item:
-                continue
-            if isinstance(item, bytes):
-                m = re.search(rb"UIDVALIDITY\s+(\d+)", item)
-            else:
-                m = re.search(r"UIDVALIDITY\s+(\d+)", str(item))
-            if m:
-                return int(m.group(1))
-
-    raise RuntimeError("Could not read UIDVALIDITY")
+    return out
 
 
 def imap_create_folder_if_needed(c, folder):
@@ -178,58 +108,20 @@ def imap_create_folder_if_needed(c, folder):
     return False
 
 
-def _parse_uid_search_data(data):
-    if not data or not data[0]:
-        return []
-    out = []
-    for p in data[0].split():
-        try:
-            out.append(int(p))
-        except Exception:
-            pass
-    return out
-
-
-def imap_get_max_uid(c):
-    # Best-effort: get the max existing UID in the currently selected mailbox.
-    typ, data = c.uid("SEARCH", None, "ALL")
+def imap_search_messages(c):
+    # Refresh the current message list each time to avoid relying on stale ids.
+    typ, data = c.search(None, "UNDELETED")
     if typ != "OK":
-        typ2, data2 = c.search(None, "ALL")
-        if typ2 != "OK":
-            return None
-        uids = _parse_uid_search_data(data2)
-    else:
-        uids = _parse_uid_search_data(data)
-
-    if not uids:
-        return 0
-    return max(uids)
+        raise RuntimeError("SEARCH UNDELETED failed: %s" % (data,))
+    return _parse_search_data(data)
 
 
-def imap_search_uids(c, last_uid):
-    # Some servers reject "UID SEARCH UID <range>" as invalid; when using UID command,
-    # the search criteria should already be UID-based (no "UID" search key).
-    q = "%d:*" % (last_uid + 1)
-    logging.debug("Searching UIDs with UID SEARCH query: %s", q)
-    typ, data = c.uid("SEARCH", None, q)
-    if typ == "OK":
-        return _parse_uid_search_data(data)
-
-    # Fallback for servers that reject UID SEARCH but accept SEARCH UID ...
-    logging.warning("UID SEARCH failed (%s); falling back to SEARCH UID", data)
-    q2 = "UID %d:*" % (last_uid + 1)
-    typ2, data2 = c.search(None, q2)
-    if typ2 != "OK":
-        raise RuntimeError("UID SEARCH failed: %s; SEARCH UID failed: %s" % (data, data2))
-    return _parse_uid_search_data(data2)
-
-
-def imap_fetch_rfc822(c, uid):
+def imap_fetch_rfc822(c, msg_num):
     # Fetch full message, flags, internal date and Date header.
-    logging.debug("Fetching message UID %s", uid)
-    typ, data = c.uid("FETCH", str(uid), "(RFC822 FLAGS INTERNALDATE)")
+    logging.debug("Fetching message %s", msg_num)
+    typ, data = c.fetch(str(msg_num), "(RFC822 FLAGS INTERNALDATE)")
     if typ != "OK" or not data:
-        raise RuntimeError("FETCH failed for uid %s: %s" % (uid, data))
+        raise RuntimeError("FETCH failed for message %s: %s" % (msg_num, data))
 
     raw_msg = None
     flags = []
@@ -261,7 +153,7 @@ def imap_fetch_rfc822(c, uid):
                         internaldate = meta[q1 + 1 : q2]
 
     if raw_msg is None:
-        raise RuntimeError("RFC822 body missing for uid %s" % uid)
+        raise RuntimeError("RFC822 body missing for message %s" % msg_num)
 
     # Extract Date header from the fetched full message as a fallback timestamp source.
     try:
@@ -274,6 +166,28 @@ def imap_fetch_rfc822(c, uid):
         pass
 
     return raw_msg, flags, internaldate, header_date
+
+
+def is_message_gone_error(err):
+    # Detect common IMAP responses meaning a searched message disappeared before FETCH/STORE.
+    s = str(err).lower()
+    markers = [
+        "fetch failed for message",
+        "rfc822 body missing for message",
+        "store +deleted failed for message",
+    ]
+    if not any(m in s for m in markers):
+        return False
+
+    gone_hints = [
+        "no such message",
+        "not found",
+        "invalid message set",
+        "no matching",
+        "nonexistent",
+        "expunge",
+    ]
+    return any(h in s for h in gone_hints)
 
 
 def parse_imap_internaldate_to_datetime(internaldate_str):
@@ -456,12 +370,12 @@ def gmail_append(gmail_conn, raw_msg, flags, append_date_value, labels):
     return True
 
 
-def source_delete_uid(source_conn, uid):
+def source_delete_message(source_conn, msg_num):
     # Mark message deleted on source; actual delete happens on EXPUNGE.
-    logging.debug("Marking source UID %s as deleted", uid)
-    typ, data = source_conn.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)")
+    logging.debug("Marking source message %s as deleted", msg_num)
+    typ, data = source_conn.store(str(msg_num), "+FLAGS.SILENT", "(\\Deleted)")
     if typ != "OK":
-        raise RuntimeError("STORE +Deleted failed for uid %s: %s" % (uid, data))
+        raise RuntimeError("STORE +Deleted failed for message %s: %s" % (msg_num, data))
 
 
 def source_expunge(source_conn):
@@ -497,7 +411,6 @@ def main():
     cp = load_config(sys.argv[1])
 
     poll_seconds = int(cp.get("general", "poll_seconds", fallback="60"))
-    state_db_path = cp.get("general", "state_db", fallback="./state.sqlite3")
     log_level = cp.get("general", "log_level", fallback="INFO").upper()
     create_labels = cp.get("general", "create_labels", fallback="yes").lower() in ("1", "yes", "true", "on")
     imap_timeout_seconds = int(cp.get("general", "imap_timeout_seconds", fallback="60"))
@@ -510,16 +423,12 @@ def main():
     )
     logging.info("Starting mailfetcher")
     logging.info(
-        "Settings: poll_seconds=%s state_db=%s log_level=%s create_labels=%s imap_timeout_seconds=%s",
+        "Settings: poll_seconds=%s log_level=%s create_labels=%s imap_timeout_seconds=%s",
         poll_seconds,
-        state_db_path,
         log_level,
         create_labels,
         imap_timeout_seconds,
     )
-
-    # Initialize local sync state DB.
-    db = StateDB(state_db_path)
 
     # Build Gmail profiles from config.
     gmail_profiles = {}
@@ -571,8 +480,6 @@ def main():
                     logging.error("[%s] dest_profile %s not found", sec, dprofile)
                     continue
 
-                # mailbox_id uniquely identifies a source folder for state tracking.
-                mailbox_id = "%s|%s|%s" % (shost, suser, sfolder)
                 logging.info(
                     "[%s] Source=%s:%s user=%s folder=%s -> dest=%s labels=%s",
                     sec,
@@ -592,52 +499,14 @@ def main():
                         src = imap_login(shost, sport, suser, spass, timeout=imap_timeout_seconds)
 
                         try:
-                            # Sync state check: UIDVALIDITY + last UID.
                             imap_select(src, sfolder)
-                            uidvalidity = imap_get_uidvalidity(src, sfolder)
-                            logging.info("[%s] UIDVALIDITY=%d", sec, uidvalidity)
-
-                            st = db.get(mailbox_id)
-                            if st is None:
-                                db.put(mailbox_id, uidvalidity, 0)
-                                st = {"uidvalidity": uidvalidity, "last_uid": 0}
-                                logging.info("[%s] No prior state found; initialized last_uid=0", sec)
-
-                            if st["uidvalidity"] != uidvalidity:
-                                logging.warning(
-                                    "[%s] UIDVALIDITY changed (%d -> %d). Resetting last_uid to 0",
-                                    sec,
-                                    st["uidvalidity"],
-                                    uidvalidity,
-                                )
-                                db.put(mailbox_id, uidvalidity, 0)
-                                st = {"uidvalidity": uidvalidity, "last_uid": 0}
-
-                            last_uid = st["last_uid"]
-                            logging.info("[%s] Last processed UID=%d", sec, last_uid)
-
-                            uids = imap_search_uids(src, last_uid)
-                            if not uids:
-                                # If another service deleted messages, last_uid may be beyond any existing UID.
-                                max_uid = imap_get_max_uid(src)
-                                if max_uid is not None and last_uid > max_uid:
-                                    logging.warning(
-                                        "[%s] last_uid=%d exceeds max_uid=%d; resyncing state",
-                                        sec,
-                                        last_uid,
-                                        max_uid,
-                                    )
-                                    db.put(mailbox_id, uidvalidity, max_uid)
-                                    last_uid = max_uid
-                                    uids = imap_search_uids(src, last_uid)
-
-                            if not uids:
-                                logging.info("[%s] No new messages", sec)
+                            pending = imap_search_messages(src)
+                            if not pending:
+                                logging.info("[%s] No messages to move", sec)
                                 src.logout()
                                 break
 
-                            uids.sort()
-                            logging.info("[%s] Found %d message(s), UID range %d..%d", sec, len(uids), uids[0], uids[-1])
+                            logging.info("[%s] Found %d message(s) ready to move", sec, len(pending))
 
                             gmail = gmail_conns[dprofile]
 
@@ -657,24 +526,37 @@ def main():
                                     )
 
                             moved = 0
-                            for uid in uids:
+                            while not STOP:
+                                msg_nums = imap_search_messages(src)
+                                if not msg_nums:
+                                    break
+                                msg_num = msg_nums[0]
+
                                 if STOP:
                                     break
 
-                                # Fetch source message and append to Gmail.
-                                logging.info("[%s] Copying UID %d", sec, uid)
-                                raw_msg, flags, internaldate_str, header_date_str = imap_fetch_rfc822(src, uid)
-                                append_dt = choose_append_date(internaldate_str, header_date_str)
+                                try:
+                                    # Fetch source message and append to Gmail.
+                                    logging.info("[%s] Copying message %d", sec, msg_num)
+                                    raw_msg, flags, internaldate_str, header_date_str = imap_fetch_rfc822(src, msg_num)
+                                    append_dt = choose_append_date(internaldate_str, header_date_str)
 
-                                # Apply configured labels (defaults to source email address)
-                                gmail_append(gmail, raw_msg, flags, append_dt, dest_labels)
+                                    # Apply configured labels (defaults to source email address)
+                                    gmail_append(gmail, raw_msg, flags, append_dt, dest_labels)
 
-                                source_delete_uid(src, uid)
-                                moved += 1
-
-                                # Persist progress so restarts don't re-copy mail.
-                                db.put(mailbox_id, uidvalidity, uid)
-                                logging.info("[%s] UID %d copied and checkpoint saved", sec, uid)
+                                    source_delete_message(src, msg_num)
+                                    moved += 1
+                                except Exception as msg_err:
+                                    if is_message_gone_error(msg_err):
+                                        # Source changed between SEARCH and FETCH/STORE; refresh and continue.
+                                        logging.warning(
+                                            "[%s] Message %d disappeared before copy/delete; skipping (%s)",
+                                            sec,
+                                            msg_num,
+                                            str(msg_err),
+                                        )
+                                    else:
+                                        raise
 
                             if moved > 0:
                                 # Permanently remove from source after all appends succeed.
