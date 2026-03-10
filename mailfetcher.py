@@ -308,6 +308,65 @@ def parse_dest_labels(dest_folder_value, default_label):
     return [p for p in parts if p]
 
 
+def oauth_authorize(profile_name, credentials_file, oauth_mode):
+    mode = (oauth_mode or "local_server").strip().lower()
+    flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
+
+    if mode == "local_server":
+        return flow.run_local_server(port=0)
+
+    if mode == "console":
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "[%s] OAuth console mode requires an interactive terminal to paste the auth code" % profile_name
+            )
+        if not flow.redirect_uri:
+            redirect_uris = []
+            # google-auth-oauthlib versions may expose either:
+            # - full client config ({installed:{...}} / {web:{...}})
+            # - direct installed/web subsection ({client_id:..., redirect_uris:[...]})
+            client_cfg = flow.client_config or {}
+            installed_cfg = client_cfg.get("installed", {}) if isinstance(client_cfg, dict) else {}
+            web_cfg = client_cfg.get("web", {}) if isinstance(client_cfg, dict) else {}
+            if isinstance(client_cfg, dict):
+                redirect_uris.extend(client_cfg.get("redirect_uris", []) or [])
+            if isinstance(installed_cfg, dict):
+                redirect_uris.extend(installed_cfg.get("redirect_uris", []) or [])
+            if isinstance(web_cfg, dict):
+                redirect_uris.extend(web_cfg.get("redirect_uris", []) or [])
+            if not redirect_uris:
+                # Desktop app default; keeps console flow working in headless setups.
+                redirect_uris.append("http://localhost")
+            if redirect_uris:
+                flow.redirect_uri = redirect_uris[0]
+        if not flow.redirect_uri:
+            raise RuntimeError(
+                "[%s] OAuth credentials file has no redirect_uris. "
+                "Use Google OAuth Desktop App credentials JSON."
+                % profile_name
+            )
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        print("")
+        print("[%s] Open this URL in your browser and authorize access:" % profile_name)
+        print(auth_url)
+        print(
+            "[%s] After approval, if the browser redirects to localhost and errors, "
+            "copy the 'code' parameter value from the URL."
+            % profile_name
+        )
+        code = input("[%s] Enter the authorization code: " % profile_name).strip()
+        if not code:
+            raise RuntimeError("[%s] Empty authorization code" % profile_name)
+        flow.fetch_token(code=code)
+        return flow.credentials
+
+    raise RuntimeError("[%s] Invalid oauth_mode '%s' (expected local_server or console)" % (profile_name, mode))
+
+
 def gmail_api_login(profile_name, profile):
     creds = None
     token_file = profile["token_file"]
@@ -334,8 +393,25 @@ def gmail_api_login(profile_name, profile):
             if not os.path.exists(credentials_file):
                 raise RuntimeError("[%s] Missing credentials file: %s" % (profile_name, credentials_file))
             logging.info("[%s] Starting OAuth flow using %s", profile_name, credentials_file)
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
-            creds = flow.run_local_server(port=0)
+            oauth_mode = profile.get("oauth_mode", "local_server")
+            try:
+                creds = oauth_authorize(profile_name, credentials_file, oauth_mode)
+            except Exception as e:
+                mode = (oauth_mode or "local_server").strip().lower()
+                if mode == "local_server" and sys.stdin.isatty():
+                    logging.warning(
+                        "[%s] local_server OAuth failed (%s); falling back to console OAuth mode",
+                        profile_name,
+                        str(e),
+                    )
+                    creds = oauth_authorize(profile_name, credentials_file, "console")
+                else:
+                    raise RuntimeError(
+                        "[%s] OAuth authorization failed in mode=%s: %s. "
+                        "On headless servers, set oauth_mode=console in config and run "
+                        "'mailfetcher.py --authorize-only /path/to/config.ini' from an interactive terminal."
+                        % (profile_name, mode, str(e))
+                    )
         save_gmail_token(token_file, creds)
 
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -516,11 +592,17 @@ def close_source_quietly(src):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: mailfetcher.py /path/to/config.ini")
+    raw_args = sys.argv[1:]
+    authorize_only = False
+    if "--authorize-only" in raw_args:
+        authorize_only = True
+        raw_args = [a for a in raw_args if a != "--authorize-only"]
+
+    if len(raw_args) != 1:
+        print("Usage: mailfetcher.py [--authorize-only] /path/to/config.ini")
         return 2
 
-    config_path = os.path.abspath(sys.argv[1])
+    config_path = os.path.abspath(raw_args[0])
     config_dir = os.path.dirname(config_path)
     cp = load_config(config_path)
     env_file_path = resolve_path(
@@ -562,6 +644,7 @@ def main():
                     config_dir,
                     require_config_value(cp, sec, "token_file"),
                 ),
+                "oauth_mode": cp.get(sec, "oauth_mode", fallback="local_server"),
             }
 
     if not gmail_profiles:
@@ -571,6 +654,18 @@ def main():
     logging.info("Configured %d Gmail profile(s)", len(gmail_profiles))
     source_sections = list(iter_source_sections(cp))
     logging.info("Configured %d source mailbox section(s)", len(source_sections))
+
+    if authorize_only:
+        logging.info("Authorize-only mode: authenticating Gmail profile(s) and writing token file(s)")
+        for name, g in gmail_profiles.items():
+            gmail_api_login(name, g)
+            logging.info(
+                "Authorized Gmail profile %s using token=%s",
+                name,
+                g["token_file"],
+            )
+        logging.info("Authorize-only mode complete")
+        return 0
 
     while not STOP:
         loop_start = time.time()

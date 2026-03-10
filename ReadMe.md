@@ -15,6 +15,7 @@ Gmail Setup (per destination account)
 2. Create OAuth Desktop App credentials and save the JSON file
 3. Put the credentials JSON somewhere readable and reference it from `config.ini`
 4. Run the OAuth flow once so a token JSON is created for that Gmail account
+   (for headless servers, use `oauth_mode=console` and `--authorize-only`)
 
 If you want replies to use custom From addresses (info@..., support@..., etc.):
 1. Gmail Settings -> Accounts and Import -> "Send mail as"
@@ -64,6 +65,7 @@ Gmail profile (`[gmail_*]`)
 - `username`: Gmail address (used for identification/logging).
 - `credentials_file`: Required OAuth client JSON path. If relative, it is resolved from the `config.ini` directory.
 - `token_file`: Required OAuth token JSON path. If relative, it is resolved from the `config.ini` directory.
+- `oauth_mode`: `local_server` (browser-based) or `console` (copy/paste code in terminal).
 - For hardened systemd installs, prefer:
   `credentials_file = /etc/mailfetcher/credentials.json`
   `token_file = /var/lib/mailfetcher/token-<profile>.json`
@@ -94,7 +96,7 @@ Create Python virtual environment and install dependencies:
 ```
 sudo python3 -m venv /var/lib/mailfetcher/.venv
 sudo /var/lib/mailfetcher/.venv/bin/pip install --upgrade pip
-sudo /var/lib/mailfetcher/.venv/bin/pip install -r /path/to/MailAggregator/requirements.txt
+sudo /var/lib/mailfetcher/.venv/bin/pip install -r requirements.txt
 sudo chown -R mailfetcher:mailfetcher /var/lib/mailfetcher/.venv
 ```
 
@@ -122,6 +124,15 @@ sudo chmod 640 /etc/mailfetcher/credentials.json
 sudo touch /var/lib/mailfetcher/token_jpl.json
 sudo chown mailfetcher:mailfetcher /var/lib/mailfetcher/token_jpl.json
 sudo chmod 600 /var/lib/mailfetcher/token_jpl.json
+```
+
+Bootstrap OAuth token (headless server):
+```
+# In /etc/mailfetcher/config.ini under [gmail_*], set:
+# oauth_mode = console
+
+sudo -u mailfetcher -H /var/lib/mailfetcher/.venv/bin/python \
+  /usr/local/bin/mailfetcher.py --authorize-only /etc/mailfetcher/config.ini
 ```
 
 Install secrets:
@@ -178,6 +189,12 @@ Troubleshooting
 - `ModuleNotFoundError: No module named 'google'` in `journalctl`: the service is using
   a Python interpreter without dependencies. Recreate/update `/var/lib/mailfetcher/.venv`
   and ensure `mailfetcher.service` uses `/var/lib/mailfetcher/.venv/bin/python`.
+- `could not locate runnable browser` in `journalctl`: OAuth is trying browser mode on a
+  headless server. Set `oauth_mode=console`, run `--authorize-only` once interactively to
+  generate the token, then restart the service.
+- `Error 400: invalid_request` with `Missing required parameter: redirect_uri`: your OAuth
+  client JSON is missing valid redirect URIs (or is the wrong client type). Use Google
+  OAuth Desktop App credentials and update `credentials_file` in `config.ini`.
 - No messages moved: Check that `source_folder` is correct and that another
   client is not moving or deleting messages before MailAggregator sees them.
 - Messages not appearing in Gmail: Verify the `dest_profile` and `dest_folder`
