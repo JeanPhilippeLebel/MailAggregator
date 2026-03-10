@@ -64,6 +64,9 @@ Gmail profile (`[gmail_*]`)
 - `username`: Gmail address (used for identification/logging).
 - `credentials_file`: Required OAuth client JSON path. If relative, it is resolved from the `config.ini` directory.
 - `token_file`: Required OAuth token JSON path. If relative, it is resolved from the `config.ini` directory.
+- For hardened systemd installs, prefer:
+  `credentials_file = /etc/mailfetcher/credentials.json`
+  `token_file = /var/lib/mailfetcher/token-<profile>.json`
 
 Source mailbox (`[src_*]`)
 - `source_host`: Source IMAP host.
@@ -87,6 +90,14 @@ sudo chown -R mailfetcher:mailfetcher /var/lib/mailfetcher
 sudo chmod 700 /var/lib/mailfetcher
 ```
 
+Create Python virtual environment and install dependencies:
+```
+sudo python3 -m venv /var/lib/mailfetcher/.venv
+sudo /var/lib/mailfetcher/.venv/bin/pip install --upgrade pip
+sudo /var/lib/mailfetcher/.venv/bin/pip install -r /path/to/MailAggregator/requirements.txt
+sudo chown -R mailfetcher:mailfetcher /var/lib/mailfetcher/.venv
+```
+
 Install app:
 ```
 sudo cp mailfetcher.py /usr/local/bin/mailfetcher.py
@@ -101,6 +112,18 @@ sudo chown root:mailfetcher /etc/mailfetcher/config.ini
 sudo chmod 640 /etc/mailfetcher/config.ini
 ```
 
+Install Gmail OAuth files:
+```
+sudo cp credentials.json /etc/mailfetcher/credentials.json
+sudo chown root:mailfetcher /etc/mailfetcher/credentials.json
+sudo chmod 640 /etc/mailfetcher/credentials.json
+
+# Create/write token location (must be writable by service user)
+sudo touch /var/lib/mailfetcher/token_jpl.json
+sudo chown mailfetcher:mailfetcher /var/lib/mailfetcher/token_jpl.json
+sudo chmod 600 /var/lib/mailfetcher/token_jpl.json
+```
+
 Install secrets:
 ```
 sudo cp secrets.env /var/lib/mailfetcher/secrets.env
@@ -113,6 +136,9 @@ Install service unit:
 sudo cp mailfetcher.service /etc/systemd/system/mailfetcher.service
 sudo systemctl daemon-reload
 ```
+
+Service runtime:
+- `ExecStart` runs `/var/lib/mailfetcher/.venv/bin/python` so Gmail API dependencies come from the service venv.
 
 Enable and start:
 ```
@@ -141,12 +167,17 @@ docker compose down
 Security Notes
 --------------
 - Keep `secrets.env` at `chmod 600`.
+- Keep OAuth token files in `/var/lib/mailfetcher` at `chmod 600`.
+- Keep `credentials.json` in `/etc/mailfetcher` at `chmod 640`.
 - Prefer env var references in `config.ini` over plain text secrets.
 
 Troubleshooting
 ---------------
 - Authentication failures: Confirm the Gmail API is enabled, the OAuth
   credentials path is correct, and the token file matches the target account.
+- `ModuleNotFoundError: No module named 'google'` in `journalctl`: the service is using
+  a Python interpreter without dependencies. Recreate/update `/var/lib/mailfetcher/.venv`
+  and ensure `mailfetcher.service` uses `/var/lib/mailfetcher/.venv/bin/python`.
 - No messages moved: Check that `source_folder` is correct and that another
   client is not moving or deleting messages before MailAggregator sees them.
 - Messages not appearing in Gmail: Verify the `dest_profile` and `dest_folder`

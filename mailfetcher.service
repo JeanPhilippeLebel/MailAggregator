@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/var/lib/mailfetcher/secrets.env
-ExecStart=/usr/local/bin/mailfetcher.py /etc/mailfetcher/config.ini
+ExecStart=/var/lib/mailfetcher/.venv/bin/python /usr/local/bin/mailfetcher.py /etc/mailfetcher/config.ini
 Restart=always
 RestartSec=5
 User=mailfetcher
