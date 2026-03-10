@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Local/private runtime config and secrets
+config.ini
+secrets.env
+
+# OAuth credentials/tokens
+credentials*.json
+token*.json

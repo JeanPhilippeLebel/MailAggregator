@@ -2,23 +2,60 @@
 """
 Mail fetcher:
 - Connects to one or more source IMAP mailboxes.
-- Appends new messages into Gmail via IMAP APPEND.
+- Imports new messages into Gmail via the Gmail API.
 - Applies Gmail labels from config; defaults to per-source label (source email address).
-- Deletes from source only after a successful append+label.
+- Deletes from source only after a successful Gmail import.
 """
+import base64
 import configparser
+import datetime
+import email.policy
 import imaplib
 import logging
 import os
 import signal
-import ssl
 import sys
 import time
-import datetime
-import re
-from email.utils import parsedate_to_datetime
+from email.parser import BytesParser
+from email.utils import format_datetime, parsedate_to_datetime
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 STOP = False
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.insert",
+    "https://www.googleapis.com/auth/gmail.labels",
+]
+SYSTEM_LABEL_MAP = {
+    "\\Inbox": "INBOX",
+    "\\Important": "IMPORTANT",
+    "\\Starred": "STARRED",
+    "\\Sent": "SENT",
+    "\\Draft": "DRAFT",
+    "\\Drafts": "DRAFT",
+    "\\Spam": "SPAM",
+    "\\Trash": "TRASH",
+    "\\Unread": "UNREAD",
+}
+KNOWN_SYSTEM_LABEL_IDS = {
+    "INBOX",
+    "IMPORTANT",
+    "STARRED",
+    "SENT",
+    "DRAFT",
+    "SPAM",
+    "TRASH",
+    "UNREAD",
+    "CATEGORY_PERSONAL",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+}
 
 
 def handle_signal(signum, frame):
@@ -53,10 +90,59 @@ def get_secret_from_env(cp, section_name, env_key_name, fallback_plain_key=None)
     raise RuntimeError("Missing secret reference in section %s (expected %s)" % (section_name, env_key_name))
 
 
+def resolve_path(config_dir, raw_value):
+    raw = (raw_value or "").strip()
+    if os.path.isabs(raw):
+        return raw
+    return os.path.abspath(os.path.join(config_dir, raw))
+
+
+def ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def save_gmail_token(token_file, creds):
+    ensure_parent_dir(token_file)
+    with open(token_file, "w", encoding="utf-8") as token:
+        token.write(creds.to_json())
+
+
+def require_config_value(cp, section_name, key_name):
+    value = cp.get(section_name, key_name, fallback="").strip()
+    if not value:
+        raise RuntimeError("Missing required config value %s in section %s" % (key_name, section_name))
+    return value
+
+
+def load_env_file(env_path):
+    if not env_path or not os.path.exists(env_path):
+        return False
+
+    loaded = 0
+    with open(env_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            os.environ[key] = value
+            loaded += 1
+
+    logging.info("Loaded %d env var(s) from %s", loaded, env_path)
+    return True
+
+
 def imap_login(host, port, username, password, timeout=30):
     # Login with SSL and a socket timeout to avoid hanging indefinitely.
     logging.info("IMAP login: connecting to %s:%s as %s", host, port, username)
-    ctx = ssl.create_default_context()
+    ctx = ssl_create_default_context()
     try:
         c = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=timeout)
     except TypeError:
@@ -74,6 +160,12 @@ def imap_login(host, port, username, password, timeout=30):
         raise RuntimeError("IMAP login failed for %s: %s" % (username, data))
     logging.info("IMAP login: authenticated as %s on %s:%s", username, host, port)
     return c
+
+
+def ssl_create_default_context():
+    import ssl
+
+    return ssl.create_default_context()
 
 
 def imap_select(c, folder):
@@ -95,17 +187,6 @@ def _parse_search_data(data):
         except Exception:
             pass
     return out
-
-
-def imap_create_folder_if_needed(c, folder):
-    # Create a Gmail label (folder) if configured; no-op if it already exists.
-    typ, _ = c.create('"%s"' % folder)
-    if typ == "OK":
-        return True
-    typ2, data2 = c.list(directory='""', pattern='"%s"' % folder)
-    if typ2 == "OK" and data2:
-        return True
-    return False
 
 
 def imap_search_messages(c):
@@ -155,7 +236,6 @@ def imap_fetch_rfc822(c, msg_num):
     if raw_msg is None:
         raise RuntimeError("RFC822 body missing for message %s" % msg_num)
 
-    # Extract Date header from the fetched full message as a fallback timestamp source.
     try:
         head = raw_msg.split(b"\r\n\r\n", 1)[0]
         for line in head.decode("utf-8", errors="ignore").splitlines():
@@ -191,7 +271,7 @@ def is_message_gone_error(err):
 
 
 def parse_imap_internaldate_to_datetime(internaldate_str):
-    # Parse IMAP INTERNALDATE into a timezone-aware datetime for APPEND.
+    # Parse IMAP INTERNALDATE into a timezone-aware datetime.
     if not internaldate_str:
         return None
     try:
@@ -217,118 +297,6 @@ def choose_append_date(internaldate_str, header_date_str):
 
     return datetime.datetime.now().astimezone()
 
-def gmail_select_folder(gmail_conn, folder):
-    # STORE requires SELECTED state on many IMAP servers.
-    current = getattr(gmail_conn, "_selected_folder", None)
-    if current == folder:
-        return True
-    typ, data = gmail_conn.select('"%s"' % folder, readonly=False)
-    if typ != "OK":
-        raise RuntimeError("Gmail SELECT failed for %s: %s" % (folder, data))
-    gmail_conn._selected_folder = folder
-    return True
-
-def _parse_appenduid(data):
-    if not data:
-        return None
-    for item in data:
-        if not item:
-            continue
-        if isinstance(item, bytes):
-            s = item.decode("utf-8", errors="ignore")
-        else:
-            s = str(item)
-        m = re.search(r"APPENDUID\s+(\d+)\s+(\d+)", s)
-        if m:
-            return (int(m.group(1)), int(m.group(2)))
-    return None
-
-
-def _decode_list_line(x):
-    if isinstance(x, bytes):
-        return x.decode("utf-8", errors="ignore")
-    return str(x)
-
-
-def gmail_find_all_mail_folder(gmail_conn):
-    """
-    Try to find the server's "All Mail" mailbox name.
-    Returns a mailbox name string, or None if not found.
-    """
-    typ, data = gmail_conn.list()
-    if typ != "OK" or not data:
-        return None
-
-    candidates = []
-    for line in data:
-        s = _decode_list_line(line)
-
-        # Prefer IMAP attributes that indicate All Mail (\All).
-        # Example: (\HasNoChildren \All) "/" "[Gmail]/All Mail"
-        if re.search(r"\(.*\\All.*\)", s, flags=re.IGNORECASE):
-            m = re.findall(r'"([^"]+)"\s*$', s)
-            if m:
-                return m[-1]
-            parts = s.split(" ")
-            if parts:
-                return parts[-1].strip()
-
-        # Take the last quoted string as mailbox name if present
-        m = re.findall(r'"([^"]+)"\s*$', s)
-        if m:
-            mbox = m[-1]
-        else:
-            parts = s.split(" ")
-            mbox = parts[-1].strip()
-
-        if "all mail" in mbox.lower():
-            candidates.append(mbox)
-
-    for prefer in ["[Gmail]/All Mail", "[Google Mail]/All Mail", "All Mail"]:
-        for c in candidates:
-            if c == prefer:
-                return c
-
-    return candidates[0] if candidates else None
-
-
-def gmail_add_labels(gmail_conn, uid, labels, folder=None):
-    clean = []
-    seen = set()
-    for x in labels or []:
-        if not x:
-            continue
-        x = str(x).strip()
-        if not x:
-            continue
-        if x not in seen:
-            seen.add(x)
-            clean.append(x)
-
-    if not clean:
-        return True
-
-    if folder:
-        gmail_select_folder(gmail_conn, folder)
-    else:
-        # Best-effort fallback: select All Mail if known, otherwise INBOX.
-        sel = getattr(gmail_conn, "_all_mail_folder", None) or "INBOX"
-        gmail_select_folder(gmail_conn, sel)
-
-    def _fmt_label(label):
-        # Gmail IMAP expects system labels like \Inbox as atoms (unquoted).
-        if label.startswith("\\"):
-            return label
-        # Quote and escape for IMAP quoted string.
-        safe = label.replace("\\", "\\\\").replace('"', "")
-        return '"%s"' % safe
-
-    label_list = "(" + " ".join([_fmt_label(l) for l in clean]) + ")"
-    typ, data = gmail_conn.uid("STORE", str(uid), "+X-GM-LABELS.SILENT", label_list)
-    if typ != "OK":
-        raise RuntimeError("Gmail X-GM-LABELS STORE failed for uid %s: %s" % (uid, data))
-    return True
-
 
 def parse_dest_labels(dest_folder_value, default_label):
     # dest_folder can be a comma-separated list of labels.
@@ -340,33 +308,171 @@ def parse_dest_labels(dest_folder_value, default_label):
     return [p for p in parts if p]
 
 
-def gmail_append(gmail_conn, raw_msg, flags, append_date_value, labels):
-    # Append into All Mail when possible, otherwise INBOX. Then apply provided labels.
-    keep = []
+def gmail_api_login(profile_name, profile):
+    creds = None
+    token_file = profile["token_file"]
+    credentials_file = profile["credentials_file"]
+
+    if os.path.exists(token_file):
+        try:
+            creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+        except Exception as e:
+            logging.warning("[%s] Could not load token file %s: %s", profile_name, token_file, str(e))
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            logging.info("[%s] Refreshing Gmail API token", profile_name)
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                raise RuntimeError(
+                    "[%s] Gmail token refresh failed. The stored token likely has the wrong scopes. "
+                    "Delete %s and re-authorize with scopes: %s. Original error: %s"
+                    % (profile_name, token_file, ", ".join(SCOPES), str(e))
+                )
+        else:
+            if not os.path.exists(credentials_file):
+                raise RuntimeError("[%s] Missing credentials file: %s" % (profile_name, credentials_file))
+            logging.info("[%s] Starting OAuth flow using %s", profile_name, credentials_file)
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
+            creds = flow.run_local_server(port=0)
+        save_gmail_token(token_file, creds)
+
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    client = {
+        "service": service,
+        "profile_name": profile_name,
+        "username": profile.get("username") or "me",
+        "labels_by_name": None,
+        "labels_by_id": set(),
+    }
+    gmail_refresh_label_cache(client)
+    return client
+
+
+def gmail_refresh_label_cache(gmail_client):
+    response = gmail_client["service"].users().labels().list(userId="me").execute()
+    labels_by_name = {}
+    labels_by_id = set()
+    for label in response.get("labels", []):
+        name = label.get("name")
+        label_id = label.get("id")
+        if name and label_id:
+            labels_by_name[name] = label_id
+            labels_by_id.add(label_id)
+    gmail_client["labels_by_name"] = labels_by_name
+    gmail_client["labels_by_id"] = labels_by_id
+
+
+def resolve_system_label_id(label_name):
+    clean = str(label_name or "").strip()
+    if not clean:
+        return None
+    if clean in SYSTEM_LABEL_MAP:
+        return SYSTEM_LABEL_MAP[clean]
+    upper = clean.upper()
+    if upper in KNOWN_SYSTEM_LABEL_IDS:
+        return upper
+    return None
+
+
+def gmail_lookup_label_id(gmail_client, label_name):
+    if gmail_client["labels_by_name"] is None:
+        gmail_refresh_label_cache(gmail_client)
+    return gmail_client["labels_by_name"].get(label_name)
+
+
+def gmail_create_label_if_needed(gmail_client, label_name):
+    system_label_id = resolve_system_label_id(label_name)
+    if system_label_id:
+        return system_label_id
+
+    existing = gmail_lookup_label_id(gmail_client, label_name)
+    if existing:
+        return existing
 
     try:
-        internaldate = imaplib.Time2Internaldate(append_date_value)
+        created = gmail_client["service"].users().labels().create(
+            userId="me",
+            body={
+                "name": label_name,
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+            },
+        ).execute()
+    except HttpError as e:
+        if getattr(e.resp, "status", None) == 409:
+            gmail_refresh_label_cache(gmail_client)
+            existing = gmail_lookup_label_id(gmail_client, label_name)
+            if existing:
+                return existing
+        raise RuntimeError("Gmail label create failed for %s: %s" % (label_name, str(e)))
+
+    label_id = created.get("id")
+    if not label_id:
+        raise RuntimeError("Gmail label create returned no id for %s" % label_name)
+    gmail_client["labels_by_name"][label_name] = label_id
+    gmail_client["labels_by_id"].add(label_id)
+    return label_id
+
+
+def build_gmail_label_ids(gmail_client, configured_labels, source_flags, create_labels):
+    label_ids = []
+    seen = set()
+
+    def add_label_id(label_id):
+        if label_id and label_id not in seen:
+            seen.add(label_id)
+            label_ids.append(label_id)
+
+    add_label_id("UNREAD")
+
+    for label_name in configured_labels or []:
+        system_label_id = resolve_system_label_id(label_name)
+        if system_label_id:
+            add_label_id(system_label_id)
+            continue
+
+        label_id = gmail_lookup_label_id(gmail_client, label_name)
+        if not label_id:
+            if not create_labels:
+                raise RuntimeError("Destination label %s does not exist and create_labels=no" % label_name)
+            label_id = gmail_create_label_if_needed(gmail_client, label_name)
+        add_label_id(label_id)
+
+    return label_ids
+
+
+def normalize_message_date(raw_msg, append_dt):
+    # Gmail API can only derive internal date from the message Date header.
+    try:
+        msg = BytesParser(policy=email.policy.default).parsebytes(raw_msg)
+        formatted = format_datetime(append_dt)
+        if "Date" in msg:
+            msg.replace_header("Date", formatted)
+        else:
+            msg["Date"] = formatted
+        return msg.as_bytes(policy=email.policy.SMTP)
     except Exception as e:
-        logging.warning("Could not convert append date (%s); appending with server time", e)
-        internaldate = None
+        logging.warning("Could not normalize Date header for Gmail import: %s", str(e))
+        return raw_msg
 
-    if not hasattr(gmail_conn, "_all_mail_folder"):
-        gmail_conn._all_mail_folder = gmail_find_all_mail_folder(gmail_conn)
 
-    append_folder = gmail_conn._all_mail_folder or "INBOX"
-
-    typ, data = gmail_conn.append('"%s"' % append_folder, " ".join(keep), internaldate, raw_msg)
-    if typ != "OK":
-        raise RuntimeError("Gmail APPEND failed (folder=%s): %s" % (append_folder, data))
-
-    au = _parse_appenduid(data)
-    if au is None:
-        logging.warning("APPEND ok but no APPENDUID returned; cannot apply X-GM-LABELS for this message")
-        return True
-
-    _uidvalidity, new_uid = au
-    gmail_add_labels(gmail_conn, new_uid, labels, folder=append_folder)
-    logging.debug("Gmail APPEND ok folder=%s uid=%s labels=%s", append_folder, new_uid, labels)
+def gmail_import_message(gmail_client, raw_msg, flags, append_dt, labels, create_labels):
+    label_ids = build_gmail_label_ids(gmail_client, labels, flags, create_labels)
+    prepared_msg = normalize_message_date(raw_msg, append_dt)
+    body = {
+        "raw": base64.urlsafe_b64encode(prepared_msg).decode("ascii"),
+        "labelIds": label_ids,
+    }
+    result = gmail_client["service"].users().messages().import_(
+        userId="me",
+        body=body,
+        internalDateSource="dateHeader",
+    ).execute()
+    if not result.get("id"):
+        raise RuntimeError("Gmail API import returned no message id")
+    logging.debug("Gmail API import ok id=%s labels=%s", result.get("id"), label_ids)
     return True
 
 
@@ -402,13 +508,25 @@ def iter_source_sections(cp):
             yield sec
 
 
+def close_source_quietly(src):
+    try:
+        src.logout()
+    except Exception:
+        pass
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: mailfetcher.py /path/to/config.ini")
         return 2
 
-    # Load config and general settings.
-    cp = load_config(sys.argv[1])
+    config_path = os.path.abspath(sys.argv[1])
+    config_dir = os.path.dirname(config_path)
+    cp = load_config(config_path)
+    env_file_path = resolve_path(
+        config_dir,
+        cp.get("general", "env_file", fallback="secrets.env"),
+    )
 
     poll_seconds = int(cp.get("general", "poll_seconds", fallback="60"))
     log_level = cp.get("general", "log_level", fallback="INFO").upper()
@@ -429,16 +547,21 @@ def main():
         create_labels,
         imap_timeout_seconds,
     )
+    load_env_file(env_file_path)
 
-    # Build Gmail profiles from config.
     gmail_profiles = {}
     for sec in cp.sections():
         if sec.startswith("gmail_"):
             gmail_profiles[sec] = {
-                "host": cp.get(sec, "host"),
-                "port": int(cp.get(sec, "port", fallback="993")),
-                "username": cp.get(sec, "username"),
-                "app_password": get_secret_from_env(cp, sec, "app_password_env", fallback_plain_key="app_password"),
+                "username": cp.get(sec, "username", fallback=""),
+                "credentials_file": resolve_path(
+                    config_dir,
+                    require_config_value(cp, sec, "credentials_file"),
+                ),
+                "token_file": resolve_path(
+                    config_dir,
+                    require_config_value(cp, sec, "token_file"),
+                ),
             }
 
     if not gmail_profiles:
@@ -454,14 +577,14 @@ def main():
         gmail_conns = {}
         try:
             logging.info("Starting poll cycle")
-            # Connect to all Gmail profiles first (shared across sources).
             for name, g in gmail_profiles.items():
-                gmail_conns[name] = imap_login(
-                    g["host"], g["port"], g["username"], g["app_password"], timeout=imap_timeout_seconds
+                gmail_conns[name] = gmail_api_login(name, g)
+                logging.info(
+                    "Connected Gmail profile %s using token=%s",
+                    name,
+                    g["token_file"],
                 )
-                logging.info("Connected Gmail profile %s as %s", name, g["username"])
 
-            # Process each source section sequentially.
             for sec in source_sections:
                 if STOP:
                     break
@@ -472,8 +595,6 @@ def main():
                 spass = get_secret_from_env(cp, sec, "source_password_env", fallback_plain_key="source_password")
                 sfolder = cp.get(sec, "source_folder", fallback="INBOX")
                 dprofile = cp.get(sec, "dest_profile")
-
-                # Default label is the source email address
                 dfolder = cp.get(sec, "dest_folder", fallback="")
 
                 if dprofile not in gmail_conns:
@@ -491,96 +612,75 @@ def main():
                     dfolder or suser,
                 )
 
-                # Retry loop for transient network or IMAP issues.
                 backoff = 1
                 for attempt in range(1, 6):
+                    src = None
                     try:
                         logging.info("[%s] Attempt %d/5: connecting source %s", sec, attempt, suser)
                         src = imap_login(shost, sport, suser, spass, timeout=imap_timeout_seconds)
-
-                        try:
-                            imap_select(src, sfolder)
-                            pending = imap_search_messages(src)
-                            if not pending:
-                                logging.info("[%s] No messages to move", sec)
-                                src.logout()
-                                break
-
-                            logging.info("[%s] Found %d message(s) ready to move", sec, len(pending))
-
-                            gmail = gmail_conns[dprofile]
-
-                            dest_labels = parse_dest_labels(dfolder, suser)
-
-                            if create_labels and dest_labels:
-                                for lbl in dest_labels:
-                                    # Skip creating system labels like \Inbox.
-                                    if lbl.startswith("\\"):
-                                        continue
-                                    created = imap_create_folder_if_needed(gmail, lbl)
-                                    logging.info(
-                                        "[%s] Destination label %s ready (created_or_exists=%s)",
-                                        sec,
-                                        lbl,
-                                        created,
-                                    )
-
-                            moved = 0
-                            while not STOP:
-                                msg_nums = imap_search_messages(src)
-                                if not msg_nums:
-                                    break
-                                msg_num = msg_nums[0]
-
-                                if STOP:
-                                    break
-
-                                try:
-                                    # Fetch source message and append to Gmail.
-                                    logging.info("[%s] Copying message %d", sec, msg_num)
-                                    raw_msg, flags, internaldate_str, header_date_str = imap_fetch_rfc822(src, msg_num)
-                                    append_dt = choose_append_date(internaldate_str, header_date_str)
-
-                                    # Apply configured labels (defaults to source email address)
-                                    gmail_append(gmail, raw_msg, flags, append_dt, dest_labels)
-
-                                    source_delete_message(src, msg_num)
-                                    moved += 1
-                                except Exception as msg_err:
-                                    if is_message_gone_error(msg_err):
-                                        # Source changed between SEARCH and FETCH/STORE; refresh and continue.
-                                        logging.warning(
-                                            "[%s] Message %d disappeared before copy/delete; skipping (%s)",
-                                            sec,
-                                            msg_num,
-                                            str(msg_err),
-                                        )
-                                    else:
-                                        raise
-
-                            if moved > 0:
-                                # Permanently remove from source after all appends succeed.
-                                source_expunge(src)
-                                logging.info(
-                                    "[%s] Moved %d messages to %s (labels: %s)",
-                                    sec,
-                                    moved,
-                                    dprofile,
-                                    ", ".join(dest_labels) if dest_labels else "(none)",
-                                )
-
-                            src.logout()
+                        imap_select(src, sfolder)
+                        pending = imap_search_messages(src)
+                        if not pending:
+                            logging.info("[%s] No messages to move", sec)
+                            close_source_quietly(src)
                             break
 
-                        except Exception:
-                            # Ensure source connection is closed on failures.
+                        logging.info("[%s] Found %d message(s) ready to move", sec, len(pending))
+                        gmail = gmail_conns[dprofile]
+                        dest_labels = parse_dest_labels(dfolder, suser)
+
+                        if create_labels and dest_labels:
+                            for lbl in dest_labels:
+                                if resolve_system_label_id(lbl):
+                                    continue
+                                label_id = gmail_create_label_if_needed(gmail, lbl)
+                                logging.info(
+                                    "[%s] Destination label %s ready (id=%s)",
+                                    sec,
+                                    lbl,
+                                    label_id,
+                                )
+
+                        moved = 0
+                        while not STOP:
+                            msg_nums = imap_search_messages(src)
+                            if not msg_nums:
+                                break
+                            msg_num = msg_nums[0]
+
                             try:
-                                src.logout()
-                            except Exception:
-                                pass
-                            raise
+                                logging.info("[%s] Copying message %d", sec, msg_num)
+                                raw_msg, flags, internaldate_str, header_date_str = imap_fetch_rfc822(src, msg_num)
+                                append_dt = choose_append_date(internaldate_str, header_date_str)
+                                gmail_import_message(gmail, raw_msg, flags, append_dt, dest_labels, create_labels)
+                                source_delete_message(src, msg_num)
+                                moved += 1
+                            except Exception as msg_err:
+                                if is_message_gone_error(msg_err):
+                                    logging.warning(
+                                        "[%s] Message %d disappeared before copy/delete; skipping (%s)",
+                                        sec,
+                                        msg_num,
+                                        str(msg_err),
+                                    )
+                                else:
+                                    raise
+
+                        if moved > 0:
+                            source_expunge(src)
+                            logging.info(
+                                "[%s] Moved %d messages to %s (labels: %s)",
+                                sec,
+                                moved,
+                                dprofile,
+                                ", ".join(dest_labels) if dest_labels else "(none)",
+                            )
+
+                        close_source_quietly(src)
+                        break
 
                     except Exception as e:
+                        close_source_quietly(src)
                         logging.warning("[%s] Attempt %d failed: %s", sec, attempt, str(e))
                         logging.info("[%s] Sleeping %ds before retry", sec, backoff)
                         time.sleep(backoff)
@@ -588,23 +688,11 @@ def main():
                 else:
                     logging.error("[%s] Exhausted retries after 5 attempts", sec)
 
-            # Always close Gmail connections for this loop.
-            for c in gmail_conns.values():
-                try:
-                    c.logout()
-                except Exception:
-                    pass
             logging.info("Poll cycle complete")
 
         except Exception as e:
             logging.error("Loop error: %s", str(e))
-            for c in gmail_conns.values():
-                try:
-                    c.logout()
-                except Exception:
-                    pass
 
-        # Sleep until the next poll; allow SIGINT/SIGTERM to interrupt.
         elapsed = time.time() - loop_start
         sleep_s = max(1, poll_seconds - int(elapsed))
         logging.info("Sleeping %ds before next poll", sleep_s)

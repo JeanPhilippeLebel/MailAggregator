@@ -7,6 +7,10 @@ RUN useradd -r -u 10001 -g nogroup -s /usr/sbin/nologin mailfetcher \
 
 WORKDIR /app
 
+# Install runtime dependencies
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
 # Copy app
 COPY --chown=mailfetcher:nogroup mailfetcher.py /app/mailfetcher.py
 

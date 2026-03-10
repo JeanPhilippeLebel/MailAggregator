@@ -4,17 +4,17 @@ MailAggregator
 Overview
 --------
 This repo contains a small IMAP-to-Gmail mail mover. It pulls new messages
-from one or more source IMAP mailboxes and appends them into Gmail folders
-(labels). After a successful append, the source message is deleted and
+from one or more source IMAP mailboxes and imports them into Gmail labels
+through the Gmail API. After a successful import, the source message is deleted and
 expunged. Each poll scans the current source folder and moves whatever is
 still present.
 
 Gmail Setup (per destination account)
 ------------------------------------
-1. Gmail Settings -> Forwarding and POP/IMAP -> enable IMAP
-2. Turn on 2FA
-3. Create an app password for "Mail"
-4. Put that app password in `secrets.env` and reference it in `config.ini`
+1. Create a Google Cloud project and enable the Gmail API
+2. Create OAuth Desktop App credentials and save the JSON file
+3. Put the credentials JSON somewhere readable and reference it from `config.ini`
+4. Run the OAuth flow once so a token JSON is created for that Gmail account
 
 If you want replies to use custom From addresses (info@..., support@..., etc.):
 1. Gmail Settings -> Accounts and Import -> "Send mail as"
@@ -24,7 +24,7 @@ If you want replies to use custom From addresses (info@..., support@..., etc.):
 What It Does
 ------------
 - Near real-time inbound sync from source IMAP to Gmail
-- Deletes from source only after Gmail append succeeds
+- Deletes from source only after Gmail import succeeds
 - Creates destination labels if `create_labels=yes`
 - Supports multiple Gmail profiles and multiple source mailboxes
 - Preserves Seen/Unseen and an original-ish timestamp
@@ -45,22 +45,25 @@ Configuration Files
 - A fully commented template you can copy to create your own `config.ini`.
 
 `secrets.env`
-- Holds app passwords and source passwords as environment variables.
-- `config.ini` references them via `*_env` keys to avoid storing plain text.
+- Holds source mailbox passwords as environment variables.
+- `config.ini` references them via `source_password_env` to avoid storing plain text.
+
+`*.json`
+- Holds Google OAuth client credentials and per-account token files.
+- Token files are refreshed automatically when possible.
 
 Configuration Reference
 -----------------------
 General (`[general]`)
 - `poll_seconds`: Poll interval in seconds.
 - `log_level`: `DEBUG`, `INFO`, `WARNING`, or `ERROR`.
+- `env_file`: Optional env file to load at startup. If relative, it is resolved from the `config.ini` directory. Defaults to `secrets.env`. For hardened systemd installs, prefer `/var/lib/mailfetcher/secrets.env`.
 - `create_labels`: `yes`/`no` to auto-create destination Gmail labels.
 
 Gmail profile (`[gmail_*]`)
-- `host`: IMAP host (typically `imap.gmail.com`).
-- `port`: IMAP SSL port (typically `993`).
-- `username`: Gmail address.
-- `app_password_env`: Env var name holding the Gmail app password.
-- `app_password`: Optional plain-text fallback (not recommended).
+- `username`: Gmail address (used for identification/logging).
+- `credentials_file`: Required OAuth client JSON path. If relative, it is resolved from the `config.ini` directory.
+- `token_file`: Required OAuth token JSON path. If relative, it is resolved from the `config.ini` directory.
 
 Source mailbox (`[src_*]`)
 - `source_host`: Source IMAP host.
@@ -100,9 +103,9 @@ sudo chmod 640 /etc/mailfetcher/config.ini
 
 Install secrets:
 ```
-sudo cp secrets.env /etc/mailfetcher/secrets.env
-sudo chown root:mailfetcher /etc/mailfetcher/secrets.env
-sudo chmod 640 /etc/mailfetcher/secrets.env
+sudo cp secrets.env /var/lib/mailfetcher/secrets.env
+sudo chown mailfetcher:mailfetcher /var/lib/mailfetcher/secrets.env
+sudo chmod 600 /var/lib/mailfetcher/secrets.env
 ```
 
 Install service unit:
@@ -142,11 +145,11 @@ Security Notes
 
 Troubleshooting
 ---------------
-- Authentication failures: Confirm IMAP is enabled in Gmail and the app password
-  is referenced correctly in `config.ini` and exported in `secrets.env`.
+- Authentication failures: Confirm the Gmail API is enabled, the OAuth
+  credentials path is correct, and the token file matches the target account.
 - No messages moved: Check that `source_folder` is correct and that another
   client is not moving or deleting messages before MailAggregator sees them.
 - Messages not appearing in Gmail: Verify the `dest_profile` and `dest_folder`
-  values and that the destination Gmail account is connected.
+  values and that the destination Gmail account is authorized.
 - Frequent retries: Network instability or provider rate limits can cause
-  backoff retries. Check IMAP connectivity from the host.
+  backoff retries. Check source IMAP connectivity and Gmail API access from the host.
