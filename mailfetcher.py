@@ -58,6 +58,10 @@ KNOWN_SYSTEM_LABEL_IDS = {
 }
 
 
+class GmailInvalidAttachmentError(RuntimeError):
+    pass
+
+
 def handle_signal(signum, frame):
     # Allow clean shutdown between poll cycles and between message copies.
     global STOP
@@ -534,18 +538,57 @@ def normalize_message_date(raw_msg, append_dt):
         return raw_msg
 
 
+def datetime_to_gmail_internal_date_ms(dt):
+    if dt is None:
+        dt = datetime.datetime.now(datetime.timezone.utc)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.datetime.now().astimezone().tzinfo)
+    return str(int(dt.timestamp() * 1000))
+
+
+def is_invalid_attachment_http_error(err):
+    if not isinstance(err, HttpError):
+        return False
+    if getattr(err.resp, "status", None) != 400:
+        return False
+    return "Invalid attachment" in str(err)
+
+
 def gmail_import_message(gmail_client, raw_msg, flags, append_dt, labels, create_labels):
     label_ids = build_gmail_label_ids(gmail_client, labels, flags, create_labels)
     prepared_msg = normalize_message_date(raw_msg, append_dt)
-    body = {
-        "raw": base64.urlsafe_b64encode(prepared_msg).decode("ascii"),
-        "labelIds": label_ids,
-    }
-    result = gmail_client["service"].users().messages().import_(
-        userId="me",
-        body=body,
-        internalDateSource="dateHeader",
-    ).execute()
+    encoded_prepared = base64.urlsafe_b64encode(prepared_msg).decode("ascii")
+    body = {"raw": encoded_prepared, "labelIds": label_ids}
+
+    try:
+        result = gmail_client["service"].users().messages().import_(
+            userId="me",
+            body=body,
+            internalDateSource="dateHeader",
+        ).execute()
+    except HttpError as e:
+        if not is_invalid_attachment_http_error(e):
+            raise
+
+        logging.warning(
+            "[%s] Gmail import rejected message as invalid attachment; retrying with messages.insert",
+            gmail_client["profile_name"],
+        )
+        fallback_body = {
+            "raw": base64.urlsafe_b64encode(raw_msg).decode("ascii"),
+            "labelIds": label_ids,
+            "internalDate": datetime_to_gmail_internal_date_ms(append_dt),
+        }
+        result = gmail_client["service"].users().messages().insert(
+            userId="me",
+            body=fallback_body,
+            internalDateSource="receivedTime",
+        ).execute()
+    except HttpError as e:
+        if is_invalid_attachment_http_error(e):
+            raise GmailInvalidAttachmentError(str(e))
+        raise
+
     if not result.get("id"):
         raise RuntimeError("Gmail API import returned no message id")
     logging.debug("Gmail API import ok id=%s labels=%s", result.get("id"), label_ids)
@@ -737,11 +780,16 @@ def main():
                                 )
 
                         moved = 0
+                        skipped_invalid_attachments = set()
                         while not STOP:
                             msg_nums = imap_search_messages(src)
-                            if not msg_nums:
+                            msg_num = None
+                            for candidate in msg_nums:
+                                if candidate not in skipped_invalid_attachments:
+                                    msg_num = candidate
+                                    break
+                            if msg_num is None:
                                 break
-                            msg_num = msg_nums[0]
 
                             try:
                                 logging.info("[%s] Copying message %d", sec, msg_num)
@@ -751,7 +799,15 @@ def main():
                                 source_delete_message(src, msg_num)
                                 moved += 1
                             except Exception as msg_err:
-                                if is_message_gone_error(msg_err):
+                                if isinstance(msg_err, GmailInvalidAttachmentError):
+                                    skipped_invalid_attachments.add(msg_num)
+                                    logging.warning(
+                                        "[%s] Skipping message %d because Gmail rejected an attachment: %s",
+                                        sec,
+                                        msg_num,
+                                        str(msg_err),
+                                    )
+                                elif is_message_gone_error(msg_err):
                                     logging.warning(
                                         "[%s] Message %d disappeared before copy/delete; skipping (%s)",
                                         sec,
