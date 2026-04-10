@@ -700,15 +700,20 @@ def main():
 
     if authorize_only:
         logging.info("Authorize-only mode: authenticating Gmail profile(s) and writing token file(s)")
+        failed_profiles = 0
         for name, g in gmail_profiles.items():
-            gmail_api_login(name, g)
-            logging.info(
-                "Authorized Gmail profile %s using token=%s",
-                name,
-                g["token_file"],
-            )
+            try:
+                gmail_api_login(name, g)
+                logging.info(
+                    "Authorized Gmail profile %s using token=%s",
+                    name,
+                    g["token_file"],
+                )
+            except Exception as e:
+                failed_profiles += 1
+                logging.error("[%s] Authorization failed: %s", name, str(e))
         logging.info("Authorize-only mode complete")
-        return 0
+        return 1 if failed_profiles else 0
 
     while not STOP:
         loop_start = time.time()
@@ -716,12 +721,19 @@ def main():
         try:
             logging.info("Starting poll cycle")
             for name, g in gmail_profiles.items():
-                gmail_conns[name] = gmail_api_login(name, g)
-                logging.info(
-                    "Connected Gmail profile %s using token=%s",
-                    name,
-                    g["token_file"],
-                )
+                try:
+                    gmail_conns[name] = gmail_api_login(name, g)
+                    logging.info(
+                        "Connected Gmail profile %s using token=%s",
+                        name,
+                        g["token_file"],
+                    )
+                except Exception as e:
+                    logging.error("[%s] Gmail login failed; skipping profile for this cycle: %s", name, str(e))
+
+            if not gmail_conns:
+                logging.error("No Gmail profiles authenticated successfully this cycle")
+                continue
 
             for sec in source_sections:
                 if STOP:
