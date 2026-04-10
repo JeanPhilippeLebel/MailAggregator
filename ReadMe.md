@@ -53,6 +53,9 @@ Configuration Files
 - Holds Google OAuth client credentials and per-account token files.
 - Token files are refreshed automatically when possible.
 
+`invalid-token-alert-state.txt`
+- Optional state file used to rate-limit invalid-token alert emails to once per day.
+
 Configuration Reference
 -----------------------
 General (`[general]`)
@@ -60,6 +63,17 @@ General (`[general]`)
 - `log_level`: `DEBUG`, `INFO`, `WARNING`, or `ERROR`.
 - `env_file`: Optional env file to load at startup. If relative, it is resolved from the `config.ini` directory. Defaults to `secrets.env`. For hardened systemd installs, prefer `/var/lib/mailfetcher/secrets.env`.
 - `create_labels`: `yes`/`no` to auto-create destination Gmail labels.
+- `invalid_token_alert_enabled`: `yes`/`no` to send a notification email when a Gmail token refresh fails because the token is no longer valid.
+- `invalid_token_alert_to`: Recipient for invalid-token alerts, such as `jplebel@google.com`.
+- `invalid_token_alert_source_section`: Optional `src_*` section to reuse for alert delivery. When set, MailAggregator uses that source account's username and stored password for SMTP.
+- `invalid_token_alert_from`: Sender address for invalid-token alerts. Defaults to `mailfetcher@localhost`.
+- `invalid_token_alert_state_file`: File used to remember whether an alert has already been sent today. Defaults to `/var/lib/mailfetcher/invalid-token-alert-state.txt` when `config.ini` is under `/etc/mailfetcher`, otherwise `invalid-token-alert-state.txt` relative to `config.ini`.
+- `invalid_token_alert_smtp_host`: SMTP relay hostname for alert emails. Defaults to `localhost`.
+- `invalid_token_alert_smtp_port`: SMTP relay port for alert emails. Defaults to `25`.
+- `invalid_token_alert_smtp_starttls`: `yes`/`no` to enable STARTTLS before sending alert email.
+- `invalid_token_alert_smtp_username`: Optional SMTP username for alert emails.
+- `invalid_token_alert_smtp_password_env`: Optional env var containing the SMTP password for alert emails.
+- `invalid_token_alert_smtp_password`: Optional plain-text SMTP password for alert emails (not recommended).
 
 Gmail profile (`[gmail_*]`)
 - `username`: Gmail address (used for identification/logging).
@@ -76,6 +90,10 @@ Source mailbox (`[src_*]`)
 - `source_username`: Source mailbox user.
 - `source_password_env`: Env var name holding the source password.
 - `source_password`: Optional plain-text fallback (not recommended).
+- `source_smtp_host`: Optional SMTP host for sending alerts or outbound mail. Defaults to `source_host`.
+- `source_smtp_port`: Optional SMTP port for sending alerts or outbound mail. Defaults to `587`.
+- `source_smtp_starttls`: `yes`/`no` to enable STARTTLS for the source account's SMTP connection. Defaults to `yes`.
+- `source_smtp_from`: Optional sender address for SMTP mail. Defaults to `source_username`.
 - `source_folder`: Folder to pull from (default `INBOX`).
 - `dest_profile`: Gmail profile name to receive mail.
 - `dest_folder`: Comma-separated list of Gmail labels to apply. If empty, defaults to the source email address.
