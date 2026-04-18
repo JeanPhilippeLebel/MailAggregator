@@ -16,6 +16,7 @@ Gmail Setup (per destination account)
 3. Put the credentials JSON somewhere readable and reference it from `config.ini`
 4. Run the OAuth flow once so a token JSON is created for that Gmail account
    (for headless servers, use `oauth_mode=console` and `--authorize-only`)
+5. You can also run the local token admin web UI with `--web` to renew tokens from a browser
 
 If you want replies to use custom From addresses (info@..., support@..., etc.):
 1. Gmail Settings -> Accounts and Import -> "Send mail as"
@@ -153,6 +154,33 @@ sudo -u mailfetcher -H /var/lib/mailfetcher/.venv/bin/python \
   /usr/local/bin/mailfetcher.py --authorize-only /etc/mailfetcher/config.ini
 ```
 
+Run token admin web UI manually:
+```
+sudo -u mailfetcher -H /var/lib/mailfetcher/.venv/bin/python \
+  /usr/local/bin/mailfetcher.py --web --web-host 0.0.0.0 --web-port 9941 \
+  --web-base-url https://www.ds.tools /etc/mailfetcher/config.ini
+```
+
+Then open:
+```
+http://127.0.0.1:9941/
+http://serverdstools:9941/
+http://serverdstools.local:9941/
+```
+
+The web UI lists each `gmail_*` profile and lets you:
+- start a new OAuth authorization in your browser
+- paste the returned Google authorization code
+- save a fresh token file without using the terminal prompt
+
+Automatic callback mode:
+- For Google-compliant automatic callback, the checked-in examples use `https://www.ds.tools`.
+- Start the web UI with `--web-base-url https://www.ds.tools` so OAuth uses that callback URL instead of localhost.
+- Your Google OAuth client must be a `Web application` client with `https://www.ds.tools/oauth/callback` added as an authorized redirect URI.
+
+Manual fallback:
+- If Google rejects the redirect URI or redirects somewhere unusable, copy either the full redirected URL or just the `code` parameter value and paste it into the web form.
+
 Install secrets:
 ```
 sudo cp secrets.env /var/lib/mailfetcher/secrets.env
@@ -163,21 +191,26 @@ sudo chmod 600 /var/lib/mailfetcher/secrets.env
 Install service unit:
 ```
 sudo cp mailfetcher.service /etc/systemd/system/mailfetcher.service
+sudo cp mailfetcher-web.service /etc/systemd/system/mailfetcher-web.service
 sudo systemctl daemon-reload
 ```
 
 Service runtime:
 - `ExecStart` runs `/var/lib/mailfetcher/.venv/bin/python` so Gmail API dependencies come from the service venv.
+- `mailfetcher.service` runs the sync loop.
+- `mailfetcher-web.service` binds the token renewal web UI to `0.0.0.0:9941` so you can reach it via `127.0.0.1`, `serverdstools`, and `serverdstools.local`, while OAuth callbacks use `https://www.ds.tools`.
 
 Enable and start:
 ```
 sudo systemctl daemon-reload
 sudo systemctl enable --now mailfetcher.service
+sudo systemctl enable --now mailfetcher-web.service
 ```
 
 Logs:
 ```
 sudo journalctl -u mailfetcher.service -f
+sudo journalctl -u mailfetcher-web.service -f
 ```
 
 Docker
@@ -193,6 +226,55 @@ Stop:
 docker compose down
 ```
 
+To run the token admin web UI in Docker instead of the sync loop, override the command and publish a port:
+```
+docker compose run --service-ports --rm \
+  -p 9941:9941 \
+  mailfetcher /app/mailfetcher.py --web --web-host 0.0.0.0 --web-port 9941 /config/config.ini
+```
+
+HTTPS Reverse Proxy
+-------------------
+For Google automatic callback, use a real HTTPS hostname and a Web Application OAuth client.
+
+1. Create a DNS name for the server, such as `mailfetcher.example.com`.
+2. Put Apache, Nginx, Caddy, or another reverse proxy in front of MailAggregator.
+3. Point the proxy at `http://127.0.0.1:9941`.
+4. Obtain a TLS certificate for the hostname.
+5. Start MailAggregator with a fixed base URL:
+```
+sudo -u mailfetcher -H /var/lib/mailfetcher/.venv/bin/python \
+  /usr/local/bin/mailfetcher.py --web --web-host 0.0.0.0 --web-port 9941 \
+  --web-base-url https://www.ds.tools /etc/mailfetcher/config.ini
+```
+6. In Google Cloud Console, create or use an OAuth client of type `Web application`.
+7. Add this exact redirect URI:
+```
+https://www.ds.tools/oauth/callback
+```
+
+Apache example:
+- An example vhost is included in `mailfetcher-apache.conf`.
+- Enable proxy modules:
+```
+sudo a2enmod proxy proxy_http headers ssl
+```
+- Copy the vhost file, verify `www.ds.tools`, enable the site, and reload Apache:
+```
+sudo cp mailfetcher-apache.conf /etc/apache2/sites-available/mailfetcher.conf
+sudo nano /etc/apache2/sites-available/mailfetcher.conf
+sudo a2ensite mailfetcher.conf
+sudo apachectl configtest
+sudo systemctl reload apache2
+```
+- Then add TLS with your usual Apache method, such as Certbot:
+```
+sudo certbot --apache -d www.ds.tools
+```
+
+Nginx example:
+- An example server block is included in `mailfetcher-nginx.conf`.
+
 Security Notes
 --------------
 - Keep `secrets.env` at `chmod 600`.
@@ -204,6 +286,8 @@ Troubleshooting
 ---------------
 - Authentication failures: Confirm the Gmail API is enabled, the OAuth
   credentials path is correct, and the token file matches the target account.
+- Google shows `invalid_request` or blocks sign-in: you are likely using a LAN hostname, plain HTTP callback, or the wrong OAuth client type. Switch to a `Web application` OAuth client with a real HTTPS callback URL such as `https://www.ds.tools/oauth/callback`.
+- Automatic callback fails with `redirect_uri_mismatch`: add the exact HTTPS callback URL you are using to the Google OAuth client, or use the manual paste-back fallback in the web UI.
 - `ModuleNotFoundError: No module named 'google'` in `journalctl`: the service is using
   a Python interpreter without dependencies. Recreate/update `/var/lib/mailfetcher/.venv`
   and ensure `mailfetcher.service` uses `/var/lib/mailfetcher/.venv/bin/python`.

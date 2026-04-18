@@ -10,16 +10,20 @@ import base64
 import configparser
 import datetime
 import email.policy
+import html
 import imaplib
 import logging
 import os
+import secrets
 import signal
 import smtplib
 import sys
 import time
+import urllib.parse
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import format_datetime, parsedate_to_datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -479,25 +483,7 @@ def oauth_authorize(profile_name, credentials_file, oauth_mode):
             raise RuntimeError(
                 "[%s] OAuth console mode requires an interactive terminal to paste the auth code" % profile_name
             )
-        if not flow.redirect_uri:
-            redirect_uris = []
-            # google-auth-oauthlib versions may expose either:
-            # - full client config ({installed:{...}} / {web:{...}})
-            # - direct installed/web subsection ({client_id:..., redirect_uris:[...]})
-            client_cfg = flow.client_config or {}
-            installed_cfg = client_cfg.get("installed", {}) if isinstance(client_cfg, dict) else {}
-            web_cfg = client_cfg.get("web", {}) if isinstance(client_cfg, dict) else {}
-            if isinstance(client_cfg, dict):
-                redirect_uris.extend(client_cfg.get("redirect_uris", []) or [])
-            if isinstance(installed_cfg, dict):
-                redirect_uris.extend(installed_cfg.get("redirect_uris", []) or [])
-            if isinstance(web_cfg, dict):
-                redirect_uris.extend(web_cfg.get("redirect_uris", []) or [])
-            if not redirect_uris:
-                # Desktop app default; keeps console flow working in headless setups.
-                redirect_uris.append("http://localhost")
-            if redirect_uris:
-                flow.redirect_uri = redirect_uris[0]
+        ensure_oauth_redirect_uri(flow)
         if not flow.redirect_uri:
             raise RuntimeError(
                 "[%s] OAuth credentials file has no redirect_uris. "
@@ -524,6 +510,31 @@ def oauth_authorize(profile_name, credentials_file, oauth_mode):
         return flow.credentials
 
     raise RuntimeError("[%s] Invalid oauth_mode '%s' (expected local_server or console)" % (profile_name, mode))
+
+
+def ensure_oauth_redirect_uri(flow):
+    if flow.redirect_uri:
+        return flow.redirect_uri
+
+    redirect_uris = []
+    # google-auth-oauthlib versions may expose either:
+    # - full client config ({installed:{...}} / {web:{...}})
+    # - direct installed/web subsection ({client_id:..., redirect_uris:[...]})
+    client_cfg = flow.client_config or {}
+    installed_cfg = client_cfg.get("installed", {}) if isinstance(client_cfg, dict) else {}
+    web_cfg = client_cfg.get("web", {}) if isinstance(client_cfg, dict) else {}
+    if isinstance(client_cfg, dict):
+        redirect_uris.extend(client_cfg.get("redirect_uris", []) or [])
+    if isinstance(installed_cfg, dict):
+        redirect_uris.extend(installed_cfg.get("redirect_uris", []) or [])
+    if isinstance(web_cfg, dict):
+        redirect_uris.extend(web_cfg.get("redirect_uris", []) or [])
+    if not redirect_uris:
+        # Desktop app default; keeps console and web-assisted flow working in headless setups.
+        redirect_uris.append("http://localhost")
+    if redirect_uris:
+        flow.redirect_uri = redirect_uris[0]
+    return flow.redirect_uri
 
 
 def gmail_api_login(profile_name, profile):
@@ -789,47 +800,15 @@ def close_source_quietly(src):
         pass
 
 
-def main():
-    raw_args = sys.argv[1:]
-    authorize_only = False
-    if "--authorize-only" in raw_args:
-        authorize_only = True
-        raw_args = [a for a in raw_args if a != "--authorize-only"]
-
-    if len(raw_args) != 1:
-        print("Usage: mailfetcher.py [--authorize-only] /path/to/config.ini")
-        return 2
-
-    config_path = os.path.abspath(raw_args[0])
+def load_runtime_config(config_path):
+    config_path = os.path.abspath(config_path)
     config_dir = os.path.dirname(config_path)
     cp = load_config(config_path)
     env_file_path = resolve_path(
         config_dir,
         cp.get("general", "env_file", fallback="secrets.env"),
     )
-
-    poll_seconds = int(cp.get("general", "poll_seconds", fallback="60"))
-    log_level = cp.get("general", "log_level", fallback="INFO").upper()
-    create_labels = cp.get("general", "create_labels", fallback="yes").lower() in ("1", "yes", "true", "on")
-    imap_timeout_seconds = int(cp.get("general", "imap_timeout_seconds", fallback="60"))
-    invalid_token_alert_cfg = load_invalid_token_alert_config(cp, config_dir)
-
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stdout,
-        force=True,
-    )
-    logging.info("Starting mailfetcher")
-    logging.info(
-        "Settings: poll_seconds=%s log_level=%s create_labels=%s imap_timeout_seconds=%s",
-        poll_seconds,
-        log_level,
-        create_labels,
-        imap_timeout_seconds,
-    )
     load_env_file(env_file_path)
-    invalid_token_alert_cfg = enrich_invalid_token_alert_config_from_source(cp, invalid_token_alert_cfg)
 
     gmail_profiles = {}
     for sec in cp.sections():
@@ -847,12 +826,558 @@ def main():
                 "oauth_mode": cp.get(sec, "oauth_mode", fallback="local_server"),
             }
 
+    return {
+        "config_path": config_path,
+        "config_dir": config_dir,
+        "cp": cp,
+        "poll_seconds": int(cp.get("general", "poll_seconds", fallback="60")),
+        "log_level": cp.get("general", "log_level", fallback="INFO").upper(),
+        "create_labels": cp.get("general", "create_labels", fallback="yes").lower() in ("1", "yes", "true", "on"),
+        "imap_timeout_seconds": int(cp.get("general", "imap_timeout_seconds", fallback="60")),
+        "invalid_token_alert_cfg": enrich_invalid_token_alert_config_from_source(
+            cp,
+            load_invalid_token_alert_config(cp, config_dir),
+        ),
+        "gmail_profiles": gmail_profiles,
+        "source_sections": list(iter_source_sections(cp)),
+    }
+
+
+def describe_gmail_token(profile):
+    token_file = profile["token_file"]
+    if not os.path.exists(token_file):
+        return {
+            "state": "missing",
+            "summary": "No token file found",
+            "detail": "Re-authorize this profile to create a new token.",
+        }
+
+    try:
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    except Exception as e:
+        return {
+            "state": "invalid",
+            "summary": "Token file could not be read",
+            "detail": str(e),
+        }
+
+    if creds.valid:
+        summary = "Token file looks valid"
+    elif creds.expired and creds.refresh_token:
+        summary = "Token is expired locally but has a refresh token"
+    elif creds.expired:
+        summary = "Token is expired and may need re-authorization"
+    else:
+        summary = "Token file exists but is not currently valid"
+
+    detail_parts = []
+    if creds.expiry:
+        detail_parts.append("Expiry: %s" % creds.expiry.isoformat())
+    detail_parts.append("Refresh token: %s" % ("yes" if creds.refresh_token else "no"))
+
+    return {
+        "state": "ok" if creds.valid else "warning",
+        "summary": summary,
+        "detail": " | ".join(detail_parts),
+    }
+
+
+def render_admin_page(title, body_html, message=""):
+    notice_html = ""
+    if message:
+        notice_html = '<div class="notice">%s</div>' % html.escape(message)
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>%s</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe4;
+      --panel: #fffaf0;
+      --ink: #1f1c18;
+      --muted: #6f6557;
+      --accent: #0f766e;
+      --accent-2: #b45309;
+      --border: #d9cbb5;
+      --ok: #166534;
+      --warn: #92400e;
+      --bad: #991b1b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background:
+        radial-gradient(circle at top left, rgba(15,118,110,0.12), transparent 34%%),
+        radial-gradient(circle at top right, rgba(180,83,9,0.14), transparent 30%%),
+        var(--bg);
+      color: var(--ink);
+      font: 16px/1.5 Georgia, "Times New Roman", serif;
+    }
+    .wrap {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    h1, h2 {
+      margin: 0 0 12px;
+      font-family: "Palatino Linotype", "Book Antiqua", Palatino, serif;
+    }
+    .hero, .card, .notice {
+      background: rgba(255, 250, 240, 0.95);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 12px 30px rgba(31, 28, 24, 0.08);
+    }
+    .hero {
+      padding: 22px;
+      margin-bottom: 18px;
+    }
+    .notice {
+      padding: 14px 16px;
+      margin-bottom: 18px;
+      color: var(--ok);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      padding: 18px;
+    }
+    .muted { color: var(--muted); }
+    .state-ok { color: var(--ok); }
+    .state-warning { color: var(--warn); }
+    .state-invalid, .state-missing { color: var(--bad); }
+    code, pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #f6efe1;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    form { margin: 12px 0 0; }
+    input[type="text"] {
+      width: 100%%;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--ink);
+    }
+    button, .button {
+      display: inline-block;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      background: linear-gradient(135deg, var(--accent), #155e75);
+      color: #fff;
+      text-decoration: none;
+      cursor: pointer;
+      font: inherit;
+    }
+    .button-secondary {
+      background: linear-gradient(135deg, var(--accent-2), #9a3412);
+    }
+    .spaced { margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    %s
+    %s
+  </div>
+</body>
+</html>
+""" % (html.escape(title), notice_html, body_html)
+
+
+class TokenAdminApp:
+    def __init__(self, runtime_cfg, configured_base_url=""):
+        self.runtime_cfg = runtime_cfg
+        self.configured_base_url = (configured_base_url or "").rstrip("/")
+        self.sessions = {}
+
+    def list_profiles(self):
+        out = []
+        for name, profile in sorted(self.runtime_cfg["gmail_profiles"].items()):
+            token_info = describe_gmail_token(profile)
+            out.append(
+                {
+                    "name": name,
+                    "username": profile.get("username", ""),
+                    "credentials_file": profile["credentials_file"],
+                    "token_file": profile["token_file"],
+                    "oauth_mode": profile.get("oauth_mode", "local_server"),
+                    "token_info": token_info,
+                }
+            )
+        return out
+
+    def resolve_base_url(self, request_headers):
+        if self.configured_base_url:
+            return self.configured_base_url
+
+        forwarded_proto = request_headers.get("X-Forwarded-Proto", "").strip()
+        proto = forwarded_proto or "http"
+        host = request_headers.get("Host", "").strip()
+        if not host:
+            raise RuntimeError("Could not determine request host for OAuth callback")
+        return "%s://%s" % (proto, host)
+
+    def start_session(self, profile_name, request_headers):
+        profile = self.runtime_cfg["gmail_profiles"].get(profile_name)
+        if not profile:
+            raise KeyError("Unknown profile %s" % profile_name)
+
+        flow = InstalledAppFlow.from_client_secrets_file(profile["credentials_file"], SCOPES)
+        session_id = secrets.token_urlsafe(24)
+        base_url = self.resolve_base_url(request_headers)
+        ui_origin = self.resolve_ui_origin(request_headers)
+        flow.redirect_uri = "%s/oauth/callback" % base_url
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+            state=session_id,
+        )
+        self.sessions[session_id] = {
+            "flow": flow,
+            "profile_name": profile_name,
+            "auth_url": auth_url,
+            "base_url": base_url,
+            "ui_origin": ui_origin,
+            "created_at": time.time(),
+        }
+        return session_id, auth_url
+
+    def resolve_ui_origin(self, request_headers):
+        referer = request_headers.get("Referer", "").strip()
+        if referer:
+            parsed = urllib.parse.urlparse(referer)
+            if parsed.scheme and parsed.netloc:
+                return "%s://%s" % (parsed.scheme, parsed.netloc)
+
+        forwarded_proto = request_headers.get("X-Forwarded-Proto", "").strip()
+        proto = forwarded_proto or "http"
+        host = request_headers.get("Host", "").strip()
+        if host:
+            return "%s://%s" % (proto, host)
+        return ""
+
+    def complete_session(self, session_id, code):
+        session = self.sessions.get(session_id)
+        if not session:
+            raise KeyError("Session expired or not found")
+        if not code:
+            raise RuntimeError("Authorization code is required")
+
+        profile_name = session["profile_name"]
+        profile = self.runtime_cfg["gmail_profiles"][profile_name]
+        flow = session["flow"]
+        clean_code = code.strip()
+        if "://" in clean_code and "code=" in clean_code:
+            parsed = urllib.parse.urlparse(clean_code)
+            query = urllib.parse.parse_qs(parsed.query)
+            clean_code = query.get("code", [""])[0].strip()
+        if not clean_code:
+            raise RuntimeError("Authorization code is required")
+        flow.fetch_token(code=clean_code)
+        save_gmail_token(profile["token_file"], flow.credentials)
+        del self.sessions[session_id]
+        return profile_name
+
+    def render_index(self, message=""):
+        cards = []
+        for item in self.list_profiles():
+            cards.append(
+                """
+<section class="card">
+  <h2>%s</h2>
+  <div class="muted">%s</div>
+  <p class="state-%s"><strong>%s</strong></p>
+  <p class="muted">%s</p>
+  <p><strong>Token file:</strong> <code>%s</code></p>
+  <p><strong>Credentials:</strong> <code>%s</code></p>
+  <form method="post" action="/start">
+    <input type="hidden" name="profile" value="%s">
+    <button type="submit">Renew Token</button>
+  </form>
+</section>
+"""
+                % (
+                    html.escape(item["name"]),
+                    html.escape(item["username"] or "(no username configured)"),
+                    html.escape(item["token_info"]["state"]),
+                    html.escape(item["token_info"]["summary"]),
+                    html.escape(item["token_info"]["detail"]),
+                    html.escape(item["token_file"]),
+                    html.escape(item["credentials_file"]),
+                    html.escape(item["name"]),
+                )
+            )
+
+        body_html = """
+<section class="hero">
+  <h1>MailAggregator Token Admin</h1>
+  <p>Use this page to re-authorize Gmail destination profiles and write fresh token files without running the interactive terminal flow.</p>
+  <p class="muted">When your Google OAuth client allows this server callback URL, renewal can complete automatically. If not, you can still paste the redirected URL or the <code>code</code> value manually.</p>
+  <p class="muted">This interface has no built-in authentication, so it should stay bound to localhost or sit behind your own reverse proxy protection.</p>
+</section>
+<div class="grid">
+  %s
+</div>
+""" % "".join(cards)
+        return render_admin_page("MailAggregator Token Admin", body_html, message=message)
+
+    def render_session_page(self, session_id, auth_url, profile_name, message=""):
+        body_html = """
+<section class="hero">
+  <h1>Renew %s</h1>
+  <p>Open the Google authorization URL below and approve access. If your Google OAuth client permits this callback URL, the token will be saved automatically when Google redirects back here.</p>
+  <p class="muted">If Google rejects the redirect URI or lands somewhere unusable, paste either the full redirected URL or just the <code>code</code> value into the form below.</p>
+  <a class="button button-secondary" href="%s" target="_blank" rel="noreferrer">Open Google Authorization</a>
+</section>
+<section class="card">
+  <h2>Expected callback URL</h2>
+  <pre>%s/oauth/callback</pre>
+</section>
+<section class="card">
+  <h2>Authorization URL</h2>
+  <pre>%s</pre>
+  <form method="post" action="/complete">
+    <input type="hidden" name="session_id" value="%s">
+    <label for="code"><strong>Authorization code or full redirected URL</strong></label>
+    <input id="code" type="text" name="code" autocomplete="off" required>
+    <div class="spaced">
+      <button type="submit">Save Token</button>
+      <a class="button button-secondary" href="/">Back</a>
+    </div>
+  </form>
+</section>
+""" % (
+            html.escape(profile_name),
+            html.escape(auth_url, quote=True),
+            html.escape(self.sessions.get(session_id, {}).get("base_url", "")),
+            html.escape(auth_url),
+            html.escape(session_id),
+        )
+        return render_admin_page("Renew %s" % profile_name, body_html, message=message)
+
+
+def make_token_admin_handler(app):
+    class TokenAdminHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/oauth/callback":
+                params = urllib.parse.parse_qs(parsed.query)
+                session_id = params.get("state", [""])[0]
+                error = params.get("error", [""])[0]
+                if error:
+                    self.send_html(
+                        400,
+                        app.render_index(
+                            message="Google authorization failed: %s" % error
+                        ),
+                    )
+                    return
+                session = app.sessions.get(session_id, {})
+                try:
+                    profile_name = app.complete_session(session_id, params.get("code", [""])[0])
+                except Exception as e:
+                    profile_name = session.get("profile_name", "profile")
+                    auth_url = session.get("auth_url", "")
+                    self.send_html(
+                        400,
+                        app.render_session_page(session_id, auth_url, profile_name, message=str(e)),
+                    )
+                    return
+                self.send_html(
+                    200,
+                    render_admin_page(
+                        "Token saved",
+                        """
+<section class="hero">
+  <h1>Token saved</h1>
+  <p>The Gmail token for <strong>%s</strong> was updated successfully.</p>
+  <a class="button" href="%s">Back to profiles</a>
+</section>
+""" % (
+                            html.escape(profile_name),
+                            html.escape((session.get("ui_origin") or "") + "/"),
+                        ),
+                    ),
+                )
+                return
+            if parsed.path != "/":
+                self.send_error(404)
+                return
+            params = urllib.parse.parse_qs(parsed.query)
+            message = params.get("message", [""])[0]
+            self.send_html(200, app.render_index(message=message))
+
+        def do_POST(self):
+            parsed = urllib.parse.urlparse(self.path)
+            form = self.parse_form()
+            try:
+                if parsed.path == "/start":
+                    profile_name = form.get("profile", "")
+                    session_id, auth_url = app.start_session(profile_name, self.headers)
+                    self.send_html(200, app.render_session_page(session_id, auth_url, profile_name))
+                    return
+                if parsed.path == "/complete":
+                    profile_name = app.complete_session(form.get("session_id", ""), form.get("code", ""))
+                    self.redirect_with_message("Token saved for %s" % profile_name)
+                    return
+            except Exception as e:
+                if parsed.path == "/start":
+                    if "redirect_uri" in str(e):
+                        self.send_html(400, app.render_index(message=str(e)))
+                    else:
+                        self.send_html(400, app.render_index(message="Failed to start OAuth flow: %s" % str(e)))
+                    return
+                if parsed.path == "/complete":
+                    session_id = form.get("session_id", "")
+                    session = app.sessions.get(session_id, {})
+                    profile_name = session.get("profile_name", "profile")
+                    auth_url = session.get("auth_url", "")
+                    self.send_html(
+                        400,
+                        app.render_session_page(session_id, auth_url, profile_name, message=str(e)),
+                    )
+                    return
+
+            self.send_error(404)
+
+        def log_message(self, fmt, *args):
+            logging.info("web-admin %s - %s", self.address_string(), fmt % args)
+
+        def parse_form(self):
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length).decode("utf-8")
+            parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+            return {k: v[0] for k, v in parsed.items()}
+
+        def send_html(self, status_code, body):
+            encoded = body.encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def redirect_with_message(self, message):
+            location = "/?%s" % urllib.parse.urlencode({"message": message})
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.end_headers()
+
+    return TokenAdminHandler
+
+
+def run_token_admin_server(runtime_cfg, host, port, base_url=""):
+    app = TokenAdminApp(runtime_cfg, configured_base_url=base_url)
+    server = ThreadingHTTPServer((host, port), make_token_admin_handler(app))
+    logging.info("Token admin listening on http://%s:%s", host, port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main():
+    raw_args = sys.argv[1:]
+    authorize_only = False
+    web_mode = False
+    web_host = "127.0.0.1"
+    web_port = 8765
+    web_base_url = ""
+    config_args = []
+
+    i = 0
+    while i < len(raw_args):
+        arg = raw_args[i]
+        if arg == "--authorize-only":
+            authorize_only = True
+        elif arg == "--web":
+            web_mode = True
+        elif arg == "--web-host":
+            i += 1
+            if i >= len(raw_args):
+                print("Usage: mailfetcher.py [--authorize-only] [--web --web-host HOST --web-port PORT] /path/to/config.ini")
+                return 2
+            web_host = raw_args[i]
+        elif arg == "--web-port":
+            i += 1
+            if i >= len(raw_args):
+                print("Usage: mailfetcher.py [--authorize-only] [--web --web-host HOST --web-port PORT] /path/to/config.ini")
+                return 2
+            web_port = int(raw_args[i])
+        elif arg == "--web-base-url":
+            i += 1
+            if i >= len(raw_args):
+                print("Usage: mailfetcher.py [--authorize-only] [--web --web-host HOST --web-port PORT --web-base-url URL] /path/to/config.ini")
+                return 2
+            web_base_url = raw_args[i].rstrip("/")
+        else:
+            config_args.append(arg)
+        i += 1
+
+    if authorize_only and web_mode:
+        print("Usage: choose either --authorize-only or --web, not both")
+        return 2
+
+    if len(config_args) != 1:
+        print("Usage: mailfetcher.py [--authorize-only] [--web --web-host HOST --web-port PORT --web-base-url URL] /path/to/config.ini")
+        return 2
+
+    config_path = os.path.abspath(config_args[0])
+    preflight_cp = load_config(config_path)
+    preflight_log_level = preflight_cp.get("general", "log_level", fallback="INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, preflight_log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+    runtime_cfg = load_runtime_config(config_path)
+    cp = runtime_cfg["cp"]
+    poll_seconds = runtime_cfg["poll_seconds"]
+    log_level = runtime_cfg["log_level"]
+    create_labels = runtime_cfg["create_labels"]
+    imap_timeout_seconds = runtime_cfg["imap_timeout_seconds"]
+    invalid_token_alert_cfg = runtime_cfg["invalid_token_alert_cfg"]
+    gmail_profiles = runtime_cfg["gmail_profiles"]
+    source_sections = runtime_cfg["source_sections"]
+
+    if web_mode:
+        logging.info("Starting token admin web interface")
+        run_token_admin_server(runtime_cfg, web_host, web_port, base_url=web_base_url)
+        return 0
+
+    logging.info("Starting mailfetcher")
+    logging.info(
+        "Settings: poll_seconds=%s log_level=%s create_labels=%s imap_timeout_seconds=%s",
+        poll_seconds,
+        log_level,
+        create_labels,
+        imap_timeout_seconds,
+    )
     if not gmail_profiles:
         logging.error("No gmail_* profiles in config")
         return 2
 
     logging.info("Configured %d Gmail profile(s)", len(gmail_profiles))
-    source_sections = list(iter_source_sections(cp))
     logging.info("Configured %d source mailbox section(s)", len(source_sections))
 
     if authorize_only:
