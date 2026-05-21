@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/var/lib/mailfetcher/secrets.env
-ExecStart=/var/lib/mailfetcher/.venv/bin/python /usr/local/bin/mailfetcher.py --web --web-host 0.0.0.0 --web-port 9941 --web-base-url https://www.ds.tools /etc/mailfetcher/config.ini
+ExecStart=/var/lib/mailfetcher/.venv/bin/python /usr/local/bin/mailfetcher.py --web --web-host 0.0.0.0 --web-port 9941 --web-base-url https://localhost /etc/mailfetcher/config.ini
 Restart=always
 RestartSec=5
 User=mailfetcher

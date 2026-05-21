@@ -170,9 +170,10 @@ def load_invalid_token_alert_config(cp, config_dir):
         ),
     )
     return {
-        "enabled": enabled and bool(recipient),
+        "enabled": enabled,
         "to": recipient,
         "source_section": cp.get(section_name, "invalid_token_alert_source_section", fallback="").strip(),
+        "token_admin_url": cp.get(section_name, "token_admin_url", fallback="").strip().rstrip("/"),
         "from": cp.get(section_name, "invalid_token_alert_from", fallback="mailfetcher@localhost").strip(),
         "smtp_host": cp.get(section_name, "invalid_token_alert_smtp_host", fallback="localhost").strip(),
         "smtp_port": int(cp.get(section_name, "invalid_token_alert_smtp_port", fallback="25")),
@@ -222,6 +223,30 @@ def enrich_invalid_token_alert_config_from_source(cp, alert_cfg):
     return merged
 
 
+def find_first_source_section_for_profile(cp, source_sections, profile_name):
+    for sec in source_sections:
+        if cp.get(sec, "dest_profile", fallback="").strip() == profile_name:
+            return sec
+    return ""
+
+
+def resolve_invalid_token_alert_config_for_profile(cp, source_sections, alert_cfg, profile_name):
+    resolved = dict(alert_cfg)
+    related_source_section = find_first_source_section_for_profile(cp, source_sections, profile_name)
+    profile_recipient = cp.get(profile_name, "username", fallback="").strip()
+
+    if profile_recipient and not resolved.get("to"):
+        resolved["to"] = profile_recipient
+
+    if related_source_section:
+        if not resolved.get("source_section"):
+            resolved["source_section"] = related_source_section
+            resolved = enrich_invalid_token_alert_config_from_source(cp, resolved)
+
+    resolved["enabled"] = resolved.get("enabled") and bool(resolved.get("to"))
+    return resolved
+
+
 def invalid_token_alert_sent_today(alert_cfg):
     if not alert_cfg.get("enabled"):
         return False
@@ -242,39 +267,57 @@ def mark_invalid_token_alert_sent_today(alert_cfg):
         f.write(datetime.date.today().isoformat())
 
 
-def send_invalid_token_alert_once_per_day(alert_cfg, profile_name, error_text):
-    if not alert_cfg.get("enabled"):
+def send_invalid_token_alert_once_per_day(cp, source_sections, alert_cfg, profile_name, error_text):
+    resolved_alert_cfg = resolve_invalid_token_alert_config_for_profile(
+        cp,
+        source_sections,
+        alert_cfg,
+        profile_name,
+    )
+
+    if not resolved_alert_cfg.get("enabled"):
+        if alert_cfg.get("enabled"):
+            logging.warning(
+                "[%s] Invalid-token alert enabled but no related recipient could be resolved",
+                profile_name,
+            )
         return
 
-    if invalid_token_alert_sent_today(alert_cfg):
+    if invalid_token_alert_sent_today(resolved_alert_cfg):
         logging.info("Invalid-token alert already sent today; skipping additional notification")
         return
 
     msg = EmailMessage()
-    msg["To"] = alert_cfg["to"]
-    msg["From"] = alert_cfg["from"]
+    msg["To"] = resolved_alert_cfg["to"]
+    msg["From"] = resolved_alert_cfg["from"]
     msg["Subject"] = "MailFetcher Gmail token invalid for %s" % profile_name
+    renewal_text = ""
+    token_admin_url = resolved_alert_cfg.get("token_admin_url", "")
+    if token_admin_url:
+        renewal_text = "Renew token: %s/\n" % token_admin_url
     msg.set_content(
         "MailFetcher detected an invalid Gmail token.\n\n"
         "Profile: %s\n"
         "Date: %s\n"
+        "%s"
         "Error: %s\n"
         % (
             profile_name,
             datetime.datetime.now().astimezone().isoformat(),
+            renewal_text,
             error_text,
         )
     )
 
     try:
-        with smtplib.SMTP(alert_cfg["smtp_host"], alert_cfg["smtp_port"], timeout=30) as smtp:
-            if alert_cfg.get("smtp_starttls"):
+        with smtplib.SMTP(resolved_alert_cfg["smtp_host"], resolved_alert_cfg["smtp_port"], timeout=30) as smtp:
+            if resolved_alert_cfg.get("smtp_starttls"):
                 smtp.starttls(context=ssl_create_default_context())
-            if alert_cfg.get("smtp_username"):
-                smtp.login(alert_cfg["smtp_username"], alert_cfg.get("smtp_password", ""))
+            if resolved_alert_cfg.get("smtp_username"):
+                smtp.login(resolved_alert_cfg["smtp_username"], resolved_alert_cfg.get("smtp_password", ""))
             smtp.send_message(msg)
-        mark_invalid_token_alert_sent_today(alert_cfg)
-        logging.info("Sent invalid-token alert email to %s", alert_cfg["to"])
+        mark_invalid_token_alert_sent_today(resolved_alert_cfg)
+        logging.info("Sent invalid-token alert email to %s", resolved_alert_cfg["to"])
     except Exception as e:
         logging.error("Failed to send invalid-token alert email: %s", str(e))
 
@@ -1395,7 +1438,13 @@ def main():
                 failed_profiles += 1
                 logging.error("[%s] Authorization failed: %s", name, str(e))
                 if isinstance(e, InvalidGmailTokenError):
-                    send_invalid_token_alert_once_per_day(invalid_token_alert_cfg, name, str(e))
+                    send_invalid_token_alert_once_per_day(
+                        cp,
+                        source_sections,
+                        invalid_token_alert_cfg,
+                        name,
+                        str(e),
+                    )
         logging.info("Authorize-only mode complete")
         return 1 if failed_profiles else 0
 
@@ -1415,7 +1464,13 @@ def main():
                 except Exception as e:
                     logging.error("[%s] Gmail login failed; skipping profile for this cycle: %s", name, str(e))
                     if isinstance(e, InvalidGmailTokenError):
-                        send_invalid_token_alert_once_per_day(invalid_token_alert_cfg, name, str(e))
+                        send_invalid_token_alert_once_per_day(
+                            cp,
+                            source_sections,
+                            invalid_token_alert_cfg,
+                            name,
+                            str(e),
+                        )
 
             if not gmail_conns:
                 logging.error("No Gmail profiles authenticated successfully this cycle")

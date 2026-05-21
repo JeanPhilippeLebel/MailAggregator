@@ -64,9 +64,10 @@ General (`[general]`)
 - `log_level`: `DEBUG`, `INFO`, `WARNING`, or `ERROR`.
 - `env_file`: Optional env file to load at startup. If relative, it is resolved from the `config.ini` directory. Defaults to `secrets.env`. For hardened systemd installs, prefer `/var/lib/mailfetcher/secrets.env`.
 - `create_labels`: `yes`/`no` to auto-create destination Gmail labels.
+- `token_admin_url`: Optional base URL for the token renewal site, such as `https://myserver`. When set, invalid-token alert emails include a direct renewal link.
 - `invalid_token_alert_enabled`: `yes`/`no` to send a notification email when a Gmail token refresh fails because the token is no longer valid.
-- `invalid_token_alert_to`: Recipient for invalid-token alerts, such as `jplebel@google.com`.
-- `invalid_token_alert_source_section`: Optional `src_*` section to reuse for alert delivery. When set, MailAggregator uses that source account's username and stored password for SMTP.
+- `invalid_token_alert_to`: Optional fixed recipient for invalid-token alerts, such as `myself@google.com`. If omitted, MailAggregator sends the alert to the expired Gmail profile's `username`.
+- `invalid_token_alert_source_section`: Optional `src_*` section to reuse for alert delivery. When set, MailAggregator uses that source account's username and stored password for SMTP. If omitted, MailAggregator reuses the first matching `src_*` mailbox for the expired Gmail profile when it can, so the alert is sent from a fetched mailbox.
 - `invalid_token_alert_from`: Sender address for invalid-token alerts. Defaults to `mailfetcher@localhost`.
 - `invalid_token_alert_state_file`: File used to remember whether an alert has already been sent today. Defaults to `/var/lib/mailfetcher/invalid-token-alert-state.txt` when `config.ini` is under `/etc/mailfetcher`, otherwise `invalid-token-alert-state.txt` relative to `config.ini`.
 - `invalid_token_alert_smtp_host`: SMTP relay hostname for alert emails. Defaults to `localhost`.
@@ -158,14 +159,14 @@ Run token admin web UI manually:
 ```
 sudo -u mailfetcher -H /var/lib/mailfetcher/.venv/bin/python \
   /usr/local/bin/mailfetcher.py --web --web-host 0.0.0.0 --web-port 9941 \
-  --web-base-url https://www.ds.tools /etc/mailfetcher/config.ini
+  --web-base-url http://127.0.0.1 /etc/mailfetcher/config.ini
 ```
 
 Then open:
 ```
 http://127.0.0.1:9941/
-http://serverdstools:9941/
-http://serverdstools.local:9941/
+http://server:9941/
+http://server.local:9941/
 ```
 
 The web UI lists each `gmail_*` profile and lets you:
@@ -174,9 +175,9 @@ The web UI lists each `gmail_*` profile and lets you:
 - save a fresh token file without using the terminal prompt
 
 Automatic callback mode:
-- For Google-compliant automatic callback, the checked-in examples use `https://www.ds.tools`.
-- Start the web UI with `--web-base-url https://www.ds.tools` so OAuth uses that callback URL instead of localhost.
-- Your Google OAuth client must be a `Web application` client with `https://www.ds.tools/oauth/callback` added as an authorized redirect URI.
+- For Google-compliant automatic callback, the checked-in examples use `https://myserver.com`.
+- Start the web UI with `--web-base-url https://myserver.com` so OAuth uses that callback URL instead of localhost.
+- Your Google OAuth client must be a `Web application` client with `https://myserver.com/oauth/callback` added as an authorized redirect URI.
 
 Manual fallback:
 - If Google rejects the redirect URI or redirects somewhere unusable, copy either the full redirected URL or just the `code` parameter value and paste it into the web form.
@@ -198,7 +199,7 @@ sudo systemctl daemon-reload
 Service runtime:
 - `ExecStart` runs `/var/lib/mailfetcher/.venv/bin/python` so Gmail API dependencies come from the service venv.
 - `mailfetcher.service` runs the sync loop.
-- `mailfetcher-web.service` binds the token renewal web UI to `0.0.0.0:9941` so you can reach it via `127.0.0.1`, `serverdstools`, and `serverdstools.local`, while OAuth callbacks use `https://www.ds.tools`.
+- `mailfetcher-web.service` binds the token renewal web UI to `0.0.0.0:9941` so you can reach it via `127.0.0.1`, `server`, and `server.local`, while OAuth callbacks use `myserver.com`.
 
 Enable and start:
 ```
@@ -245,12 +246,12 @@ For Google automatic callback, use a real HTTPS hostname and a Web Application O
 ```
 sudo -u mailfetcher -H /var/lib/mailfetcher/.venv/bin/python \
   /usr/local/bin/mailfetcher.py --web --web-host 0.0.0.0 --web-port 9941 \
-  --web-base-url https://www.ds.tools /etc/mailfetcher/config.ini
+  --web-base-url http://127.0.0.1 /etc/mailfetcher/config.ini
 ```
 6. In Google Cloud Console, create or use an OAuth client of type `Web application`.
 7. Add this exact redirect URI:
 ```
-https://www.ds.tools/oauth/callback
+http://127.0.0.1/oauth/callback
 ```
 
 Apache example:
@@ -286,7 +287,7 @@ Troubleshooting
 ---------------
 - Authentication failures: Confirm the Gmail API is enabled, the OAuth
   credentials path is correct, and the token file matches the target account.
-- Google shows `invalid_request` or blocks sign-in: you are likely using a LAN hostname, plain HTTP callback, or the wrong OAuth client type. Switch to a `Web application` OAuth client with a real HTTPS callback URL such as `https://www.ds.tools/oauth/callback`.
+- Google shows `invalid_request` or blocks sign-in: you are likely using a LAN hostname, plain HTTP callback, or the wrong OAuth client type. Switch to a `Web application` OAuth client with a real HTTPS callback URL such as `http://http://127.0.0.1/oauth/callback`.
 - Automatic callback fails with `redirect_uri_mismatch`: add the exact HTTPS callback URL you are using to the Google OAuth client, or use the manual paste-back fallback in the web UI.
 - `ModuleNotFoundError: No module named 'google'` in `journalctl`: the service is using
   a Python interpreter without dependencies. Recreate/update `/var/lib/mailfetcher/.venv`
