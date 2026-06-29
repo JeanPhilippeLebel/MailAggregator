@@ -774,6 +774,7 @@ def gmail_import_message(gmail_client, raw_msg, flags, append_dt, labels, create
             userId="me",
             body=body,
             internalDateSource="dateHeader",
+            neverMarkSpam=True,
         ).execute()
     except HttpError as e:
         if not is_invalid_attachment_http_error(e):
